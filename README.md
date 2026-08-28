@@ -16,6 +16,16 @@ GTK 4.14 / WebKitGTK 2.52.3, and run headless under Xvfb.
 
 minibrowser adds nothing to the core. Every hook is optional.
 
+## Version
+
+```
+minibrowser --version     # minibrowser 1.1.2 (build 060a193)
+make version
+```
+
+The build id is an md5 of the sources, so two builds can be told apart
+without guessing.
+
 ## Build
 
 Debian and derivatives:
@@ -36,7 +46,8 @@ minibrowser [URL] [options]
 bigbrowser  [URL|PATH|diag] [options]
 ```
 
-With no address the window comes up blank with the history open. A local
+With no address the window comes up on `about:blank` with the history popup
+open, so there is something to pick from rather than an empty window. A local
 file needs three slashes — `file:///tmp/index.html` — though a bare path
 works too (`./index.html`, `/tmp/index.html`), and anything without a
 scheme is tried as https.
@@ -92,10 +103,29 @@ the matching history under it.
   `Down` asks for it — with nothing typed yet, that is the whole history.
 - `Ctrl+H` opens the same popup on the history.
 
+Every panel — address, history, find, download directory, key list — is the
+same width: `popup_width`, 550px by default, which is about fifty
+characters of the mono font — enough for most addresses without the panel
+taking over the window. It shrinks to fit a small window rather than
+clipping, and the history list takes up to about two thirds of the window's
+height.
+
+```
+popup_width = 900         # in swov's config, or the browser's
+```
+
 `Tab` and `Down` walk forward through the matches, `Shift+Tab` and `Up`
 back, the wheel scrolls, a click opens. Whatever is selected is written into
 the input, so `Enter` always loads exactly what you can read. `Esc`,
 `Ctrl+H` or a click outside closes it.
+
+Anything the popup can save shows a **Save** and a **Cancel** button with
+the keys named on them (`Save (Enter)`, `Cancel (Esc)`) — Enter is never the
+only way in. They are text, not boxes: Cancel sits at the left in `subtext`,
+Save at the right in the accent and bold, and either underlines and
+brightens on hover. When the directory popup asks about a clash the same two
+buttons become `Drop that rule` and `Keep both`, so both answers are on
+screen rather than implied.
 
 `Esc` closes whatever is on screen — popup, key list, download list or a
 message — and reaches the page only when nothing of ours is up.
@@ -112,19 +142,53 @@ this address only, everything on the site, or everything. The narrower rule
 wins, so one page can go somewhere its site does not.
 
 ```
-~/.local/share/wkview/<profile>/download-dirs.tsv    key <TAB> directory
+~/.local/share/wkview/download-dirs.tsv    key <TAB> directory [<TAB> overwrite]
 ```
 
-The key is a whole address or a bare host. A rule set on a page also covers
+The file belongs to you, not to a profile: every profile and both browsers
+read the same rules, since which directory a site's files go in has nothing
+to do with which cookie jar is in use. Rules written by an older build are
+carried over from the profile on first run.
+
+The key is a whole address or a bare host. The scopes are independent and the
+narrower one always wins: a rule on `a.de/b` keeps its own directory when
+`a.de` gets one. Setting a rule only ever writes the key for the scope you
+picked. A rule set on a page also covers
 the files that page hands out, which usually live on another address — a
 CDN, or just a different path — so a rule on a download page catches what
 it serves.
+
+Ticking **always replace existing files** turns the question off for
+whatever that rule covers: files take the name they ask for. It follows the
+same select, so it can apply to one page, a whole site, or everything —
+`always_overwrite` in a config file does the last one permanently.
+
+If something else already points at the directory you set, you are asked
+first: `Enter` drops the older rule, `Esc` lets both use it. Sharing a
+directory is usually meant, but not always.
+
+Setting the scope to **everything** lasts for that run only — put
+`download_dir` in a config file to make it permanent.
+
+Two browsers saving into one directory do not collide either: a name is
+claimed by creating the file, so the second one moves to the next number
+rather than landing on top of the first. Tested with two instances pulling
+the same file into the same directory at once.
+
+Rules are merged on save, not overwritten: a second browser on the same
+profile re-reads the file and keeps what the first one wrote, so two
+instances cannot trample each other's rules. The same goes for search
+keywords.
 
 A file whose name is already taken is downloaded beside the old one and the
 question is asked in the download panel itself — no second popup. `Enter`
 puts it in the old one's place, `Esc` keeps both, and the transfer only
 reads as done once the file is where it is going to stay. A directory that does not exist
-is created group writable (`0770`). The download panel shows the
+is created group writable (`0770`). The panel appears the moment the server answers, and reads `starting` until
+the first byte lands. It normally fades out under the pointer so the page
+can be read through it, but a download that has just appeared outranks that
+for a few seconds — otherwise one starting while the pointer happened to
+rest there would arrive invisibly. The panel shows the
 destination in small text on the right of its header, so it is clear where
 a file is going before it lands.
 
@@ -164,8 +228,8 @@ whose name collides with a keyword still works.
 Every overlay — the popup, toast, downloads — is drawn from
 swov's palette and geometry, so the two programs read as one set. Defaults
 match swov value for value: `tile` panels at `radius 14` with a `border 3`
-outline, `text` on top, `hint` for headers, `hl` (the orange) for the caret
-and the download bar, `urgent` for failures.
+outline, `text` on top, `hint` for headers, `hl` (the orange) for the caret,
+the download bar and, at a third of its weight, for selections, `urgent` for failures.
 
 Nothing is hardcoded. `ui_css_install()` builds the stylesheet from the
 theme, so changing `hl` in a config file moves every accent at once.

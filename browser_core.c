@@ -9,6 +9,7 @@
 #include "browser_core.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 /* download overlay */
 #define DL_LINGER_SECONDS  4      /* keep a finished download on screen */
 #define DL_TICK_MS         100    /* progress / ETA refresh rate */
+#define DL_REVEAL_MS       3000   /* a new download outranks the hover fade */
 #define DL_ACTIVE_ROWS     4      /* max rows in the live overlay */
 #define DL_HISTORY_ROWS    8      /* max rows in the <mod>+D list */
 #define DL_KEEP            32     /* max downloads remembered */
@@ -127,6 +129,7 @@ static void       on_ready_to_show (WebKitWebView *view, gpointer u);
 static void       on_session_download_started (WebKitNetworkSession *session,
                                                WebKitDownload *download, gpointer u);
 static void       downloads_refresh (void);
+static void       downloads_reveal  (void);
 static void       downloads_tick_start (void);
 static void       dl_panel_rebuild  (Win *w);
 static void       css_apply_one     (WebKitUserContentManager *ucm);
@@ -333,7 +336,31 @@ profile_dirs (const char *profile, char **out_data_dir, char **out_cache_dir)
 
 typedef enum { DL_SCOPE_PAGE, DL_SCOPE_SITE, DL_SCOPE_ALL } DlScope;
 
-static GHashTable *g_dlrules;      /* host -> dir, both owned */
+static GHashTable *g_dlrules;      /* key -> dir, both owned */
+static GHashTable *g_dlgone;       /* keys this session deleted, as a set */
+static GHashTable *g_dlalways;     /* keys whose files may be replaced */
+static gboolean    g_always_overwrite;   /* ... and the same for everything */
+static gboolean    g_always_overwrite_set;  /* said so on the command line */
+
+#define DL_ALWAYS_TOKEN  "overwrite"
+#define DL_ALL_KEY       "*"         /* the line that carries the global flag */
+
+/*
+ * These rules belong to the person, not to a profile: which directory a
+ * site's files go in has nothing to do with which cookie jar is in use,
+ * and two browsers on different profiles should agree about it. So they
+ * live one level up from the profiles, in
+ *
+ *   ~/.local/share/wkview/download-dirs.tsv
+ *
+ * and every instance of either browser shares them.
+ */
+static char *
+dlrules_path (void)
+{
+    return g_build_filename (g_get_user_data_dir (), PROFILE_DIR_NAME,
+                             DLRULES_FILE, NULL);
+}
 
 static char *
 uri_host (const char *uri)
@@ -352,56 +379,204 @@ uri_host (const char *uri)
     return out;
 }
 
+/*
+ * Two browsers on one profile would otherwise trample each other: both
+ * read the file at startup, and whichever saved last would write its own
+ * idea of the world over the other's. So a save re-reads the file first
+ * and merges: what is on disk survives unless we changed that key or
+ * deleted it here. The merged table becomes ours, so the other instance's
+ * rules are picked up rather than lost.
+ */
+/* key <TAB> dir <TAB> overwrite, the last field optional. */
+static void
+dlrules_parse (const char *text, GHashTable *dirs, GHashTable *always,
+               gboolean *global_always, gboolean skip_gone)
+{
+    char **lines = g_strsplit (text, "\n", -1);
+
+    for (int i = 0; lines[i]; i++) {
+        if (!*lines[i])
+            continue;
+
+        char **f = g_strsplit (lines[i], "\t", 3);
+        gboolean ok = g_strv_length (f) >= 2 && *f[0];
+
+        if (ok && skip_gone && g_dlgone && g_hash_table_contains (g_dlgone, f[0]))
+            ok = FALSE;
+
+        if (ok) {
+            gboolean always_on = g_strv_length (f) >= 3 &&
+                                 !g_strcmp0 (g_strstrip (f[2]), DL_ALWAYS_TOKEN);
+
+            if (!g_strcmp0 (f[0], DL_ALL_KEY)) {
+                if (global_always)
+                    *global_always = always_on;
+            } else if (*f[1]) {
+                if (dirs)
+                    g_hash_table_insert (dirs, g_strdup (f[0]), g_strdup (f[1]));
+                if (always && always_on)
+                    g_hash_table_add (always, g_strdup (f[0]));
+            }
+        }
+        g_strfreev (f);
+    }
+
+    g_strfreev (lines);
+}
+
+static void
+dlrules_write (GString *s, const char *key, const char *dir)
+{
+    gboolean always = g_dlalways && g_hash_table_contains (g_dlalways, key);
+
+    g_string_append_printf (s, "%s\t%s%s%s\n", key, dir,
+                            always ? "\t" : "", always ? DL_ALWAYS_TOKEN : "");
+}
+
 static void
 dlrules_save (void)
 {
-    if (!g_dlrules || !g_data_dir)
+    if (!g_dlrules)
         return;
 
-    GString        *s = g_string_new (NULL);
-    GHashTableIter  it;
-    gpointer        k, v;
+    char       *path   = dlrules_path ();
+    GHashTable *merged = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+    char       *data   = NULL;
+
+    if (g_file_get_contents (path, &data, NULL, NULL)) {
+        /* the other instance's always-flags survive with its rules */
+        dlrules_parse (data, merged, g_dlalways, NULL, TRUE);
+        g_free (data);
+    }
+
+    GHashTableIter it;
+    gpointer       k, v;
 
     g_hash_table_iter_init (&it, g_dlrules);
     while (g_hash_table_iter_next (&it, &k, &v))
-        g_string_append_printf (s, "%s\t%s\n", (char *) k, (char *) v);
+        g_hash_table_insert (merged, g_strdup (k), g_strdup (v));   /* ours wins */
 
-    char *path = g_build_filename (g_data_dir, DLRULES_FILE, NULL);
+    GString *s = g_string_new (NULL);
+    g_hash_table_iter_init (&it, merged);
+    while (g_hash_table_iter_next (&it, &k, &v))
+        dlrules_write (s, k, v);
+
+    if (g_always_overwrite)
+        g_string_append (s, DL_ALL_KEY "\t\t" DL_ALWAYS_TOKEN "\n");
+
     if (!g_file_set_contents (path, s->str, -1, NULL))
         g_printerr ("download: cannot write %s\n", path);
+
+    g_hash_table_unref (g_dlrules);
+    g_dlrules = merged;
 
     g_free (path);
     g_string_free (s, TRUE);
 }
 
-static void
-dlrules_setup (const char *data_dir)
+/* Keys other than except_key that already point at this directory. */
+static GPtrArray *
+dl_dir_users (const char *dir, const char *except_key)
 {
-    g_dlrules = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+    GPtrArray      *out = g_ptr_array_new ();
+    GHashTableIter  it;
+    gpointer        k, v;
 
-    if (!data_dir)
-        return;                        /* --private: rules stay in memory */
+    g_hash_table_iter_init (&it, g_dlrules);
+    while (g_hash_table_iter_next (&it, &k, &v))
+        if (!g_strcmp0 ((char *) v, dir) && g_strcmp0 ((char *) k, except_key))
+            g_ptr_array_add (out, k);
 
-    char *path = g_build_filename (data_dir, DLRULES_FILE, NULL);
+    return out;
+}
+
+static void
+dl_dir_forget (const char *key)
+{
+    if (!key)
+        return;
+    if (!g_dlgone)
+        g_dlgone = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+    g_hash_table_add (g_dlgone, g_strdup (key));
+    g_hash_table_remove (g_dlrules, key);
+}
+
+/* "replace the existing link": every other rule aiming there is dropped. */
+static void
+dl_dir_clear_users (const char *dir, const char *except_key)
+{
+    GPtrArray *users = dl_dir_users (dir, except_key);
+    GPtrArray *keys  = g_ptr_array_new_with_free_func (g_free);
+
+    for (guint i = 0; i < users->len; i++)
+        g_ptr_array_add (keys, g_strdup (g_ptr_array_index (users, i)));
+
+    for (guint i = 0; i < keys->len; i++) {
+        LOG ("download: dropped rule %s\n", (char *) g_ptr_array_index (keys, i));
+        dl_dir_forget (g_ptr_array_index (keys, i));
+    }
+
+    g_ptr_array_free (users, TRUE);
+    g_ptr_array_free (keys, TRUE);
+}
+
+/* profile_dir is only consulted to carry across rules written by an
+ * older build, which kept them per profile. */
+static void
+dlrules_setup (const char *profile_dir)
+{
+    g_dlrules  = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+    g_dlalways = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+    char *path = dlrules_path ();
     char *data = NULL;
 
     if (g_file_get_contents (path, &data, NULL, NULL)) {
-        char **lines = g_strsplit (data, "\n", -1);
-        for (int i = 0; lines[i]; i++) {
-            if (!*lines[i])
-                continue;
-            char **f = g_strsplit (lines[i], "\t", 2);
-            if (g_strv_length (f) == 2 && *f[0] && *f[1])
-                g_hash_table_insert (g_dlrules, g_strdup (f[0]), g_strdup (f[1]));
-            g_strfreev (f);
-        }
-        g_strfreev (lines);
+        dlrules_parse (data, g_dlrules, g_dlalways,
+                       g_always_overwrite_set ? NULL : &g_always_overwrite, FALSE);
         g_free (data);
-        LOG ("download: %u site rules from %s\n",
-             g_hash_table_size (g_dlrules), path);
+        LOG ("download: %u rules from %s\n", g_hash_table_size (g_dlrules), path);
+        g_free (path);
+        return;
+    }
+
+    if (profile_dir) {
+        char *old = g_build_filename (profile_dir, DLRULES_FILE, NULL);
+
+        if (g_file_get_contents (old, &data, NULL, NULL)) {
+            dlrules_parse (data, g_dlrules, g_dlalways, &g_always_overwrite, FALSE);
+            g_free (data);
+            LOG ("download: carried %u rules over from %s\n",
+                 g_hash_table_size (g_dlrules), old);
+            dlrules_save ();           /* now they live with the others */
+        }
+        g_free (old);
     }
 
     g_free (path);
+}
+
+/* Whether files reached through this key may be replaced without asking. */
+static gboolean
+dl_always_for_key (const char *key)
+{
+    return g_always_overwrite ||
+           (key && g_dlalways && g_hash_table_contains (g_dlalways, key));
+}
+
+static void
+dl_always_set (const char *key, gboolean on)
+{
+    if (!key) {                        /* the everything scope */
+        g_always_overwrite = on;
+        return;
+    }
+
+    if (on)
+        g_hash_table_add (g_dlalways, g_strdup (key));
+    else
+        g_hash_table_remove (g_dlalways, key);
 }
 
 /* The directory a download from this address should land in: the most
@@ -489,8 +664,53 @@ dl_dir_for_download (WebKitDownload *download)
     return dl_dir_for_uri (file);      /* the file's host, then the general one */
 }
 
-/* scope is what the select in the <mod>+S popup decides. Setting a
- * broader scope clears the narrower rules that would have shadowed it. */
+/* The key that supplied the directory, so its always-flag can be found. */
+static char *
+dl_key_for_download (WebKitDownload *download)
+{
+    WebKitWebView    *view = webkit_download_get_web_view (download);
+    WebKitURIRequest *req  = webkit_download_get_request (download);
+
+    const char *page = view ? webkit_web_view_get_uri (view) : NULL;
+    const char *file = req  ? webkit_uri_request_get_uri (req) : NULL;
+
+    if (page && g_hash_table_contains (g_dlrules, page))
+        return g_strdup (page);
+    if (file && g_hash_table_contains (g_dlrules, file))
+        return g_strdup (file);
+
+    char *host = uri_host (page);
+    if (host && g_hash_table_contains (g_dlrules, host))
+        return host;
+    g_free (host);
+
+    host = uri_host (file);
+    if (host && g_hash_table_contains (g_dlrules, host))
+        return host;
+    g_free (host);
+
+    return NULL;                       /* the general directory answered */
+}
+
+static gboolean
+dl_always_for_download (WebKitDownload *download)
+{
+    char    *key = dl_key_for_download (download);
+    gboolean on  = dl_always_for_key (key);
+
+    g_free (key);
+    return on;
+}
+
+/*
+ * The select says which key to write, and nothing else is touched. An
+ * earlier version cleared the narrower rules when a broader one was set,
+ * on the theory that a stale page rule would shadow a new site rule -
+ * but shadowing is the whole point: a.de/b keeps its own directory when
+ * a.de gets one, which is what having three scopes is for. Clearing them
+ * also left a tombstone, so the page rule did not come back after a
+ * restart.
+ */
 static void
 dl_dir_set (const char *uri, const char *dir, DlScope scope)
 {
@@ -498,26 +718,22 @@ dl_dir_set (const char *uri, const char *dir, DlScope scope)
 
     if (scope == DL_SCOPE_PAGE && uri) {
         LOG ("download: %s -> %s\n", uri, dir);
+        if (g_dlgone) g_hash_table_remove (g_dlgone, uri);
         g_hash_table_insert (g_dlrules, g_strdup (uri), g_strdup (dir));
         dlrules_save ();
         g_free (host);
         return;
     }
 
-    if (uri)
-        g_hash_table_remove (g_dlrules, uri);
-
     if (scope == DL_SCOPE_SITE && host) {
         LOG ("download: %s -> %s\n", host, dir);
+        if (g_dlgone) g_hash_table_remove (g_dlgone, host);
         g_hash_table_insert (g_dlrules, host, g_strdup (dir));   /* takes host */
         dlrules_save ();
         return;
     }
 
-    if (host) {
-        g_hash_table_remove (g_dlrules, host);
-        g_free (host);
-    }
+    g_free (host);
     dlrules_save ();
 
     g_free (g_download_dir);
@@ -539,11 +755,34 @@ dl_dir_set (const char *uri, const char *dir, DlScope scope)
 
 static GHashTable *g_searches;     /* keyword -> url template */
 
+static void searches_setup (const char *data_dir);
+
 static void
 searches_save (void)
 {
     if (!g_searches || !g_data_dir)
         return;
+
+    /* Merged for the same reason as the download rules, and into a table
+     * of its own: reading straight into g_searches would let a stale line
+     * on disk overwrite the very change being saved. */
+    char       *path   = g_build_filename (g_data_dir, SEARCH_FILE, NULL);
+    GHashTable *merged = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+    char       *data   = NULL;
+
+    if (g_file_get_contents (path, &data, NULL, NULL)) {
+        char **lines = g_strsplit (data, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            if (!*lines[i])
+                continue;
+            char **f = g_strsplit (lines[i], "\t", 2);
+            if (g_strv_length (f) == 2 && *f[0] && *f[1])
+                g_hash_table_insert (merged, g_strdup (f[0]), g_strdup (f[1]));
+            g_strfreev (f);
+        }
+        g_strfreev (lines);
+        g_free (data);
+    }
 
     GString        *s = g_string_new (NULL);
     GHashTableIter  it;
@@ -551,10 +790,16 @@ searches_save (void)
 
     g_hash_table_iter_init (&it, g_searches);
     while (g_hash_table_iter_next (&it, &k, &v))
+        g_hash_table_insert (merged, g_strdup (k), g_strdup (v));   /* ours wins */
+
+    g_hash_table_iter_init (&it, merged);
+    while (g_hash_table_iter_next (&it, &k, &v))
         g_string_append_printf (s, "%s\t%s\n", (char *) k, (char *) v);
 
-    char *path = g_build_filename (g_data_dir, SEARCH_FILE, NULL);
     g_file_set_contents (path, s->str, -1, NULL);
+
+    g_hash_table_unref (g_searches);
+    g_searches = merged;
 
     g_free (path);
     g_string_free (s, TRUE);
@@ -673,6 +918,9 @@ typedef struct {
 
     /* text */
     int   label_px, title_px, hint_px, ws_px;
+
+    /* how wide a popup wants to be, before the window has its say */
+    int   popup_w;
     char *font;        /* "" -> whatever GTK is themed with */
     char *font_mono;   /* URLs and file names read better fixed width */
 } Theme;
@@ -723,6 +971,16 @@ css_rgba (Color c)
                             (int) (c.b * 255 + 0.5), c.a);
 }
 
+/* The same colour at a different weight: a selection wants the accent's
+ * hue without its full strength, which is what makes it read as a wash
+ * over the text rather than a block on top of it. */
+static char *
+css_rgba_at (Color c, double alpha)
+{
+    c.a *= alpha;
+    return css_rgba (c);
+}
+
 static void
 theme_defaults (void)
 {
@@ -752,6 +1010,7 @@ theme_defaults (void)
     t->win_gap  = 5.0;
     t->ui_scale = 1.0;
 
+    t->popup_w  = 550;         /* about 50 characters of the mono font */
     t->ws_px    = 26;
     t->label_px = 16;
     t->title_px = 13;
@@ -820,6 +1079,7 @@ cfg_set (const char *k, const char *v)
     }
 
     /* ---- text, shared with swov ---- */
+    if (key_is (k, "popup_w") || key_is (k, "popup_width")) { t->popup_w = atoi (v); return TRUE; }
     if (key_is (k, "ws_px") || key_is (k, "workspace_px")) { t->ws_px    = atoi (v); return TRUE; }
     if (key_is (k, "label_px") || key_is (k, "app_px"))    { t->label_px = atoi (v); return TRUE; }
     if (key_is (k, "title_px"))                            { t->title_px = atoi (v); return TRUE; }
@@ -841,6 +1101,11 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "quiet"))         { g_quiet = truthy (v); return TRUE; }
     if (key_is (k, "page_title"))    { g_want_page_title = truthy (v); return TRUE; }
     if (key_is (k, "middle_click_paste")) { g_no_middle_paste = !truthy (v); return TRUE; }
+    if (key_is (k, "always_overwrite")) {
+        g_always_overwrite     = truthy (v);
+        g_always_overwrite_set = TRUE;      /* the file must not undo this */
+        return TRUE;
+    }
     if (key_is (k, "mod"))           return parse_mod (v);
 
     /* search_s = https://example.com/?q={} */
@@ -1022,8 +1287,10 @@ usage (const char *argv0, gboolean to_stdout)
 "\n"
 "  A download shows a progress bar in the top right corner with the file\n"
 "  name, percentage and estimated time left. Move the pointer over it and\n"
-"  it fades out so you can read the page underneath; it disappears on its\n"
-"  own %d seconds after the transfer ends.\n"
+"  it fades out so you can read the page underneath, though one that has\n"
+"  just appeared stays visible anyway. It shows up as soon as the server\n"
+"  answers, reading \"starting\" until the first byte lands, and it\n"
+"  disappears on its own %d seconds after the transfer ends.\n"
 "\n",
         g_app->default_title, g_app->default_app_id, g_mod_name,
         DEFAULT_CLIP_CMD, DL_LINGER_SECONDS);
@@ -1036,8 +1303,10 @@ usage (const char *argv0, gboolean to_stdout)
 "  --download-dir DIR  download target (default: XDG download dir)\n"
 "                      single pages and whole sites can be sent elsewhere\n"
 "                      with <mod>+S; those rules live next to the profile\n"
-"                      in download-dirs.tsv, search keywords in\n"
-"                      searches.tsv. A directory that does not exist is\n"
+"                      in ~/.local/share/wkview/download-dirs.tsv, which\n"
+"                      belongs to you rather than to a profile: every\n"
+"                      profile and both browsers share it. Search keywords\n"
+"                      are per profile, in searches.tsv. A directory that does not exist is\n"
 "                      created group writable (0770)\n"
 "  --profile NAME      named profile, persists cookies (default: \"default\")\n"
 "  --clear-data        wipe the profile's data and cache before starting\n"
@@ -1064,17 +1333,20 @@ usage (const char *argv0, gboolean to_stdout)
 "  swov's file and drive both. Keys either program does not know are\n"
 "  ignored with a note on stderr.\n"
 "\n"
-"  look:    bg tile tile_sel tile_hover card card_hover text subtext dim\n"
+"  look:    popup_width (how wide the panels want to be, %d)\n"
+"           bg tile tile_sel tile_hover card card_hover text subtext dim\n"
 "           accent hl hltext hint urgent outline\n"
 "           radius border pad gap win_gap ui_scale\n"
 "           font font_mono label_px title_px hint_px\n"
 "  ours:    title app_id zoom mod clip_cmd download_dir profile private\n"
 "           no_media page_title middle_click_paste css user_agent quiet\n"
+"           always_overwrite\n"
 "           search_KEY (e.g. search_s = https://google.com/search?q={})\n"
 "\n"
 "misc:\n"
 "  -q, --quiet         silence the diagnostic output on stderr\n"
 "  -h, --help          this text\n"
+"  -V, --version       version and build id, to tell two builds apart\n"
 "\n"
 "key bindings (<mod> = %s):\n"
 "  <mod>+O  or <mod>+L type an address. Tab or Down brings up the matching\n"
@@ -1087,12 +1359,22 @@ usage (const char *argv0, gboolean to_stdout)
 "  <mod>+S             download directory. The select decides how far it\n"
 "                      reaches: this address only, everything on the site,\n"
 "                      or everything. The narrower rule wins, and a rule\n"
-"                      set on a page also covers the files it hands out\n"
+"                      set on a page also covers the files it hands out.\n"
+"                      If something else already points at that directory\n"
+"                      you are asked: Enter drops the older rule, Esc lets\n"
+"                      both use it. Tick \"always replace existing files\"\n"
+"                      and files covered by that rule take the name they\n"
+"                      ask for, with no question. \"everything\" lasts for\n"
+"                      this run only; put download_dir in a config file to\n"
+"                      keep it\n"
 "  <mod>+K             add a search keyword, as \"g URL\" with {} where the\n"
 "                      words go\n"
 "  F1  or  <mod>+/     the key list, on screen\n"
 "  <mod>+J             back: one page back, then on into the stored history\n"
 "  <mod>+Shift+J       forward, the same way round\n"
+"\n"
+"  Anything the popup can save shows a Save and a Cancel button with the\n"
+"  keys named on them, so Enter is never the only way in.\n"
 "\n"
 "  In the popup: Tab and Down walk forward through the matches, Shift+Tab\n"
 "  and Up back, the wheel scrolls, a click opens, Delete removes the entry\n"
@@ -1112,7 +1394,7 @@ usage (const char *argv0, gboolean to_stdout)
 "  <mod>+minus         zoom out\n"
 "  <mod>+0             reset zoom to 100%%\n"
 "  <mod>+Y             copy the current URL, and show what was copied\n",
-        hblock, HIST_KEEP, cfg_shared, cfg_own,
+        hblock, HIST_KEEP, cfg_shared, cfg_own, g_theme.popup_w,
         g_mod_name, DL_HISTORY_SECONDS, URL_TOAST_SECONDS);
 
     if (g_app->usage_keys)
@@ -1213,6 +1495,8 @@ ui_css_install (void)
     char *c_hl      = css_rgba (t->hl);
     char *c_hint    = css_rgba (t->hint);
     char *c_hltext  = css_rgba (t->hltext);
+    char *c_hl_soft = css_rgba_at (t->hl, 0.34);   /* selections */
+    char *c_hl_dim  = css_rgba_at (t->hl, 0.78);   /* a button at rest */
     char *c_urgent  = css_rgba (t->urgent);
     char *c_outline = css_rgba (t->outline);
 
@@ -1285,6 +1569,20 @@ ui_css_install (void)
         "label.br-key-head { color: %s; %s font-size: %.0fpx; }"
         "checkbutton.br-check, checkbutton.br-check label {"
         "  color: %s; %s font-size: %.0fpx;"
+        "}"
+        "button.br-btn {"
+        "  background: none; background-color: transparent;"
+        "  background-image: none; box-shadow: none;"
+        "  border: none; border-radius: %.0fpx; outline: none;"
+        "  color: %s; %s font-size: %.0fpx;"
+        "  padding: %.0fpx %.0fpx; min-height: 0;"
+        "}"
+        "button.br-btn:hover {"
+        "  color: %s; text-decoration-line: underline;"
+        "}"
+        "button.br-btn-primary { color: %s; font-weight: bold; }"
+        "button.br-btn-primary:hover {"
+        "  color: %s; text-decoration-line: underline;"
         "}",
         c_hint, ui_font, t->hint_px * s,
         c_subtext, mono_font, t->title_px * s,
@@ -1296,7 +1594,12 @@ ui_css_install (void)
         c_hl, mono_font, t->title_px * s,
         c_text, ui_font, t->title_px * s,
         c_hint, ui_font, t->hint_px * s,
-        c_subtext, ui_font, t->title_px * s);
+        c_subtext, ui_font, t->title_px * s,
+        t->radius / 3.0, c_subtext, ui_font, t->title_px * s,
+        t->pad / 2.0, t->pad / 2.0,
+        c_text,
+        c_hl_dim,
+        c_hl);
 
     /* ---- entries: the URL bar and the picker search share a look ---- */
     /* The input reads as a field: its own well, a rule under it, and the
@@ -1316,6 +1619,8 @@ ui_css_install (void)
         "  padding: %.0fpx %.0fpx; margin: 0;"
         "}"
         "entry.br-omni-entry:focus-within { border-bottom-color: %s; }"
+        /* tile_sel vanished against the panel and solid hl shouted; the
+         * accent at a third of its weight reads as a wash over the text */
         "entry.br-omni-entry > text > selection {"
         "  background-color: %s; color: %s;"
         "}",
@@ -1324,7 +1629,7 @@ ui_css_install (void)
         t->radius / 3.0, t->radius / 3.0,
         t->pad / 2.0, t->pad / 2.0,
         c_hl,
-        c_sel, c_text);
+        c_hl_soft, c_text);
 
     /* ---- download rows: the bar picks up the accent ---- */
     g_string_append_printf (css,
@@ -1349,15 +1654,13 @@ ui_css_install (void)
         "  border-radius: %.0fpx; padding: %.0fpx %.0fpx;"
         "}"
         "list.br-pick-list > row:hover { background-color: %s; }"
-        /* the selection carries the accent, so it is obvious which row
-         * Enter would open */
+        /* the selected row carries the accent at the same weight, so the
+         * two kinds of selection look like one idea */
         "list.br-pick-list > row:selected { background-color: %s; }"
-        "list.br-pick-list > row:selected label.br-pick-main,"
-        "list.br-pick-list > row:selected label.br-pick-sub {"
-        "  color: %s;"
-        "}",
+        "list.br-pick-list > row:selected label.br-pick-main { color: %s; }"
+        "list.br-pick-list > row:selected label.br-pick-sub { color: %s; }",
         t->radius / 2.0, t->win_gap / 2.0, t->pad / 2.0,
-        c_hover, c_hl, c_hltext);
+        c_hover, c_hl_soft, c_text, c_subtext);
 
     GtkCssProvider *p = gtk_css_provider_new ();
 #if GTK_CHECK_VERSION (4, 12, 0)
@@ -1376,6 +1679,7 @@ ui_css_install (void)
     g_free (c_card);    g_free (c_text);    g_free (c_subtext);
     g_free (c_dim);     g_free (c_hl);      g_free (c_hint);
     g_free (c_urgent);  g_free (c_outline);  g_free (c_hltext);
+    g_free (c_hl_soft); g_free (c_hl_dim);
 }
 
 /* ----------------------------------------------------------- clipboard */
@@ -1489,6 +1793,7 @@ dl_new (WebKitDownload *download, const char *name)
     g_object_set_data (G_OBJECT (download), "dl", d);
     downloads_tick_start ();
     downloads_refresh ();       /* on screen now, not at the first tick */
+    downloads_reveal ();        /* ... and not hidden under the pointer */
     return d;
 }
 
@@ -1543,6 +1848,12 @@ dl_finish (WebKitDownload *download, DlState state)
                         d->want, g_strerror (errno));
         }
     }
+
+    if (state == DL_FAILED && d->dest) {
+        GStatBuf st;
+        if (g_stat (d->dest, &st) == 0 && st.st_size == 0)
+            g_remove (d->dest);        /* drop the empty name claim */
+    }
     if (state == DL_DONE && d->total == 0)
         d->total = d->received;
 
@@ -1550,13 +1861,17 @@ dl_finish (WebKitDownload *download, DlState state)
     downloads_refresh ();
 }
 
+/*
+ * Reserve the name by creating the file rather than by looking and
+ * hoping. Two browsers saving the same file into the same directory would
+ * otherwise both see the name free, both take it, and one would land on
+ * top of the other. O_EXCL makes the claim atomic, so the loser moves on
+ * to the next number. The empty file left behind is the one WebKit then
+ * writes into, which is why the caller has to allow overwriting it.
+ */
 static char *
 unique_download_path (const char *dir, const char *suggested)
 {
-    char *path = g_build_filename (dir, suggested, NULL);
-    if (!g_file_test (path, G_FILE_TEST_EXISTS))
-        return path;
-
     const char *dot = strrchr (suggested, '.');
     char       *stem;
     const char *ext = "";
@@ -1568,13 +1883,24 @@ unique_download_path (const char *dir, const char *suggested)
         stem = g_strdup (suggested);
     }
 
-    for (int i = 1; i < 10000; i++) {
-        char *name = g_strdup_printf ("%s (%d)%s", stem, i, ext);
+    char *path = NULL;
+
+    for (int i = 0; i < 10000; i++) {
+        char *name = i == 0 ? g_strdup (suggested)
+                            : g_strdup_printf ("%s (%d)%s", stem, i, ext);
         g_free (path);
         path = g_build_filename (dir, name, NULL);
         g_free (name);
-        if (!g_file_test (path, G_FILE_TEST_EXISTS))
+
+        int fd = g_open (path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd >= 0) {
+            close (fd);
             break;
+        }
+        if (errno != EEXIST) {
+            g_printerr ("download: cannot create %s: %s\n", path, g_strerror (errno));
+            break;
+        }
     }
 
     g_free (stem);
@@ -1610,9 +1936,18 @@ on_decide_destination (WebKitDownload *download,
 
     /* WebKitGTK 2.52.x wants an absolute filesystem path here. */
     char *wanted = g_build_filename (absdir, suggested_filename, NULL);
-    char *path   = unique_download_path (absdir, suggested_filename);
-    gboolean clash = g_strcmp0 (wanted, path) != 0;
 
+    /* "always replace" turns the question off for whatever this rule
+     * covers: the file simply takes the name it asked for. */
+    gboolean always = dl_always_for_download (download);
+    char *path = always ? g_strdup (wanted)
+                        : unique_download_path (absdir, suggested_filename);
+    gboolean clash = !always && g_strcmp0 (wanted, path) != 0;
+
+    /* Before the destination, not after: setting the destination is what
+     * opens the file, and it refuses an existing one unless told. The file
+     * exists because we just created it to claim the name. */
+    webkit_download_set_allow_overwrite (download, TRUE);
     webkit_download_set_destination (download, path);
 
     char *base = g_path_get_basename (path);
@@ -2327,12 +2662,29 @@ omni_reflect (Win *w, GtkListBoxRow *row)
     w->omni_setting = FALSE;
 }
 
+/* The list is worth as much of the window as it can decently have: a
+ * fixed cap looked cramped on anything but a small screen. */
+static void
+omni_size_list (Win *w)
+{
+    int h = gtk_widget_get_height (w->win);
+
+    if (h <= 0)
+        h = 800;                        /* not mapped yet, assume the default */
+
+    gtk_scrolled_window_set_min_content_height (GTK_SCROLLED_WINDOW (w->omniscroll),
+                                                MIN (320, (int) (h * 0.35)));
+    gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (w->omniscroll),
+                                                (int) (h * 0.68));
+}
+
 static void
 omni_list_show (Win *w)
 {
     if (w->omni_list)
         return;
 
+    omni_size_list (w);
     omni_rebuild (w);
     gtk_widget_set_visible (w->omniscroll, TRUE);
     w->omni_list = TRUE;
@@ -2387,6 +2739,7 @@ omni_setup_scope (Win *w, OmniMode mode, const char *uri)
 {
     if (mode != OMNI_DLDIR) {
         gtk_widget_set_visible (w->omniscope, FALSE);
+        gtk_widget_set_visible (w->omnialways, FALSE);
         return;
     }
 
@@ -2402,6 +2755,17 @@ omni_setup_scope (Win *w, OmniMode mode, const char *uri)
     gtk_drop_down_set_model (GTK_DROP_DOWN (w->omniscope), G_LIST_MODEL (list));
     gtk_drop_down_set_selected (GTK_DROP_DOWN (w->omniscope), dl_scope_for_uri (uri));
     gtk_widget_set_visible (w->omniscope, TRUE);
+
+    /* the same select decides how far this reaches */
+    DlScope now = dl_scope_for_uri (uri);
+    char   *key = now == DL_SCOPE_PAGE ? g_strdup (uri)
+                : now == DL_SCOPE_SITE ? uri_host (uri)
+                                       : NULL;
+
+    gtk_check_button_set_active (GTK_CHECK_BUTTON (w->omnialways),
+                                 dl_always_for_key (key));
+    gtk_widget_set_visible (w->omnialways, TRUE);
+    g_free (key);
 
     g_object_unref (list);
     g_free (site);
@@ -2437,6 +2801,14 @@ omni_show (Win *w, OmniMode mode)
     gtk_widget_set_visible (w->omniscroll, FALSE);
     gtk_widget_set_visible (w->omnihint, mode == OMNI_FIND);
     gtk_label_set_text (GTK_LABEL (w->omnihint), "");
+
+    /* Typing into a box and hoping is not an interface: the two things
+     * Enter and Esc would do are on screen, with their keys named. */
+    gboolean confirmable = mode == OMNI_DLDIR || mode == OMNI_SEARCH;
+
+    gtk_button_set_label (GTK_BUTTON (w->omnisave), "Save  (Enter)");
+    gtk_button_set_label (GTK_BUTTON (w->omnicancel), "Cancel  (Esc)");
+    gtk_widget_set_visible (w->omnibuttons, confirmable);
     omni_setup_scope (w, mode, uri);
     gtk_widget_set_visible (w->omni, TRUE);
 
@@ -2584,6 +2956,37 @@ omni_apply_search (Win *w)
 
 /* Enter in the download-directory popup. */
 static void
+omni_finish_dldir (Win *w, gboolean replace_others)
+{
+    const char *uri   = webkit_web_view_get_uri (w->view);
+    DlScope     scope = (DlScope) w->dl_pending_scope;
+    char       *dir   = w->dl_pending_dir;
+    char       *key   = scope == DL_SCOPE_PAGE ? g_strdup (uri)
+                      : scope == DL_SCOPE_SITE ? uri_host (uri)
+                                               : NULL;
+
+    if (replace_others)
+        dl_dir_clear_users (dir, key);
+
+    dl_dir_make (dir);
+    dl_dir_set (uri, dir, scope);
+    dl_always_set (key, gtk_check_button_get_active (GTK_CHECK_BUTTON (w->omnialways)));
+    dlrules_save ();
+
+    char *msg = g_strdup_printf (scope == DL_SCOPE_PAGE ? "downloads for this page  %s"
+                               : scope == DL_SCOPE_SITE ? "downloads for this site  %s"
+                                                        : "downloads  %s", dir);
+
+    w->dl_conflict = FALSE;
+    g_clear_pointer (&w->dl_pending_dir, g_free);
+    omni_hide (w);
+    toast_show (w, msg, URL_TOAST_SECONDS);
+
+    g_free (msg);
+    g_free (key);
+}
+
+static void
 omni_apply_dldir (Win *w)
 {
     char       *dir   = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (w->omnientry))));
@@ -2596,26 +2999,53 @@ omni_apply_dldir (Win *w)
         return;
     }
 
-    dl_dir_make (dir);
-    dl_dir_set (uri, dir, scope);
-    omni_hide (w);
+    g_free (w->dl_pending_dir);
+    w->dl_pending_dir   = dir;          /* takes it */
+    w->dl_pending_scope = scope;
 
-    char *msg = g_strdup_printf (scope == DL_SCOPE_PAGE ? "downloads for this page  %s"
-                               : scope == DL_SCOPE_SITE ? "downloads for this site  %s"
-                                                        : "downloads  %s", dir);
-    toast_show (w, msg, URL_TOAST_SECONDS);
+    /* Somebody else is already pointing there. Both can, but say so
+     * first: sharing a directory is usually meant, and sometimes not. */
+    char      *key   = scope == DL_SCOPE_PAGE ? g_strdup (uri)
+                     : scope == DL_SCOPE_SITE ? uri_host (uri)
+                                              : NULL;
+    GPtrArray *users = dl_dir_users (dir, key);
 
-    g_free (msg);
-    g_free (dir);
+    if (users->len > 0) {
+        char *who = elide (g_ptr_array_index (users, 0), 40);
+        char *ask = users->len == 1
+                  ? g_strdup_printf ("%s already goes there.  Enter drops that rule,  Esc keeps both.", who)
+                  : g_strdup_printf ("%u rules already go there.  Enter drops them,  Esc keeps all.", users->len);
+
+        gtk_label_set_text (GTK_LABEL (w->omnihint), ask);
+        gtk_widget_set_halign (w->omnihint, GTK_ALIGN_START);
+        gtk_widget_set_visible (w->omnihint, TRUE);
+        gtk_widget_set_visible (w->omnientry, FALSE);
+        gtk_widget_set_visible (w->omniscope, FALSE);
+        gtk_widget_set_visible (w->omnialways, FALSE);
+        gtk_button_set_label (GTK_BUTTON (w->omnisave), "Drop that rule  (Enter)");
+        gtk_button_set_label (GTK_BUTTON (w->omnicancel), "Keep both  (Esc)");
+        gtk_widget_set_visible (w->omnibuttons, TRUE);
+        w->dl_conflict = TRUE;
+
+        g_free (ask);
+        g_free (who);
+        g_ptr_array_free (users, TRUE);
+        g_free (key);
+        return;                          /* the popup stays up and asks */
+    }
+
+    g_ptr_array_free (users, TRUE);
+    g_free (key);
+    omni_finish_dldir (w, FALSE);
 }
 
+/* Enter and the Save button are the same thing, so they cannot drift. */
 static void
-on_omni_activate (GtkEntry *entry, gpointer u)
+omni_confirm (Win *w)
 {
-    (void) entry;
-    Win *w = u;
-
-    if (w->omni_mode == OMNI_FIND)
+    if (w->omni_mode == OMNI_DLDIR && w->dl_conflict)
+        omni_finish_dldir (w, TRUE);          /* drop the older rule */
+    else if (w->omni_mode == OMNI_FIND)
         find_step (w, +1);
     else if (w->omni_mode == OMNI_DLDIR)
         omni_apply_dldir (w);
@@ -2623,6 +3053,37 @@ on_omni_activate (GtkEntry *entry, gpointer u)
         omni_apply_search (w);
     else
         omni_go (w);
+}
+
+/* Esc and the second button, likewise. */
+static void
+omni_dismiss (Win *w)
+{
+    if (w->omni_mode == OMNI_DLDIR && w->dl_conflict)
+        omni_finish_dldir (w, FALSE);         /* let both use it */
+    else
+        omni_hide (w);
+}
+
+static void
+on_omni_activate (GtkEntry *entry, gpointer u)
+{
+    (void) entry;
+    omni_confirm (u);
+}
+
+static void
+on_omni_save (GtkButton *b, gpointer u)
+{
+    (void) b;
+    omni_confirm (u);
+}
+
+static void
+on_omni_cancel (GtkButton *b, gpointer u)
+{
+    (void) b;
+    omni_dismiss (u);
 }
 
 static void
@@ -2736,6 +3197,13 @@ dl_row_new (Dl *d)
     if (d->state == DL_ACTIVE) {
         char *eta = NULL;
 
+        /* Before the first byte there is no percentage and no size worth
+         * showing, but the row still has to say something. */
+        if (d->received == 0) {
+            status = g_strdup ("starting");
+            goto have_status;
+        }
+
         /* Needs a size, a measured rate, and enough elapsed time that the
          * rate means something - otherwise show no estimate at all rather
          * than a wrong one. */
@@ -2754,6 +3222,8 @@ dl_row_new (Dl *d)
 
         g_free (got);
         g_free (eta);
+    have_status:
+        ;
     } else if (d->state == DL_ASK) {
         status = g_strdup ("exists:  Enter replaces,  Esc keeps both");
     } else if (d->state == DL_DONE) {
@@ -2837,6 +3307,24 @@ dl_answer_pending (gboolean overwrite)
     downloads_tick_start ();
     downloads_refresh ();
     return TRUE;
+}
+
+/*
+ * The overlay fades out under the pointer so the page can be read through
+ * it. A download that starts while the pointer happens to be parked there
+ * would then arrive invisibly, which reads as the panel being slow. So a
+ * new download un-fades it and outranks the hover for a few seconds.
+ */
+static void
+downloads_reveal (void)
+{
+    gint64 now = g_get_monotonic_time ();
+
+    for (guint i = 0; i < g_wins->len; i++) {
+        Win *w = g_ptr_array_index (g_wins, i);
+        w->dl_reveal_us = now;
+        gtk_widget_set_opacity (w->topright, 1.0);
+    }
 }
 static void
 dl_panel_rebuild (Win *w)
@@ -2998,6 +3486,11 @@ overlay_hover_update (Win *w, double x, double y)
             want = 0.0;
     }
 
+    /* a download that just appeared wins over the fade */
+    if (want == 0.0 && w->dl_reveal_us &&
+        g_get_monotonic_time () - w->dl_reveal_us < (gint64) DL_REVEAL_MS * 1000)
+        want = 1.0;
+
     if (gtk_widget_get_opacity (w->topright) != want)
         gtk_widget_set_opacity (w->topright, want);
 }
@@ -3104,6 +3597,20 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
      * filters and <mod>+A still selects the text in it. */
     /* Esc belongs to whatever is on screen; with nothing up it is the
      * page's own key, so it is passed on. */
+    /* the directory popup, mid-question: both answers apply the setting,
+     * they only differ on what happens to the rule already pointing there */
+    if (gtk_widget_get_visible (w->omni) && w->omni_mode == OMNI_DLDIR && w->dl_conflict) {
+        if (keyval == GDK_KEY_Escape) {
+            omni_finish_dldir (w, FALSE);      /* keep both */
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            omni_finish_dldir (w, TRUE);       /* drop the other rule */
+            return TRUE;
+        }
+        return TRUE;
+    }
+
     if (keyval == GDK_KEY_Escape) {
         if (close_popups (w))
             return TRUE;
@@ -3437,14 +3944,14 @@ keys_panel_new (void)
     gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
                                     GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scroll), grid);
-    gtk_scrolled_window_set_propagate_natural_width (GTK_SCROLLED_WINDOW (scroll), TRUE);
+
     gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (scroll), TRUE);
     gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (scroll), 460);
 
     GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, (int) g_theme.win_gap);
     gtk_widget_add_css_class (box, "br-keys");
-    gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+    gtk_widget_set_halign (box, GTK_ALIGN_FILL);
+    gtk_widget_set_valign (box, GTK_ALIGN_FILL);
     gtk_widget_set_visible (box, FALSE);
     gtk_box_append (GTK_BOX (box), scroll);
 
@@ -3494,6 +4001,7 @@ win_free (gpointer data)
     if (w->urltoast_id)
         g_source_remove (w->urltoast_id);
     g_free (w->omni_needle);
+    g_free (w->dl_pending_dir);
 
     g_free (w);
 }
@@ -3561,12 +4069,13 @@ on_overlay_position (GtkOverlay *ov, GtkWidget *child, GdkRectangle *alloc, gpoi
     if (W <= 0 || H <= 0)
         return FALSE;
 
-    if (child == w->omni)
-        want = w->omni_mode == OMNI_DLDIR ? 960 : 720;   /* paths are long */
-    else if (child == w->keys)
-        want = 640;
+    /* One width for every panel, whatever it holds: the address popup,
+     * the history, the directory popup and the key list are all the same
+     * object as far as the eye is concerned. */
+    if (child == w->omni || child == w->keys)
+        want = (int) (g_theme.popup_w * g_theme.ui_scale);
     else if (child == w->topright)
-        want = 360;
+        want = (int) (360 * g_theme.ui_scale);
     else
         return FALSE;                   /* not ours, let GTK align it */
 
@@ -3647,7 +4156,10 @@ window_new (WebKitWebView *view, gboolean primary)
      * sit flush against the window edge. */
     w->omni = gtk_box_new (GTK_ORIENTATION_VERTICAL, (int) g_theme.win_gap);
     gtk_widget_add_css_class (w->omni, "br-omni");
-    gtk_widget_set_halign (w->omni, GTK_ALIGN_CENTER);
+    /* FILL, not CENTER: on_overlay_position hands this widget an exact
+     * rectangle, and a centered child would shrink to its content inside
+     * it instead of taking the width we worked out. */
+    gtk_widget_set_halign (w->omni, GTK_ALIGN_FILL);
     gtk_widget_set_valign (w->omni, GTK_ALIGN_START);
     gtk_widget_set_size_request (w->omni, -1, -1);
     gtk_widget_set_visible (w->omni, FALSE);
@@ -3676,6 +4188,35 @@ window_new (WebKitWebView *view, gboolean primary)
     gtk_widget_add_css_class (w->omniscope, "br-scope");
     gtk_widget_set_visible (w->omniscope, FALSE);
     gtk_box_append (GTK_BOX (w->omni), w->omniscope);
+
+    w->omnialways = gtk_check_button_new_with_label ("always replace existing files");
+    gtk_widget_add_css_class (w->omnialways, "br-check");
+    gtk_widget_set_visible (w->omnialways, FALSE);
+    gtk_box_append (GTK_BOX (w->omni), w->omnialways);
+
+    /* the confirm row: the same two actions Enter and Esc perform */
+    /* one at each end: they are opposite answers, not a pair of options */
+    w->omnibuttons = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, (int) g_theme.win_gap);
+    gtk_widget_set_halign (w->omnibuttons, GTK_ALIGN_FILL);
+    gtk_widget_set_visible (w->omnibuttons, FALSE);
+
+    w->omnicancel = gtk_button_new_with_label ("Cancel  (Esc)");
+    gtk_widget_add_css_class (w->omnicancel, "flat");
+    gtk_widget_add_css_class (w->omnicancel, "br-btn");
+    gtk_widget_set_halign (w->omnicancel, GTK_ALIGN_START);
+    gtk_widget_set_hexpand (w->omnicancel, TRUE);
+    g_signal_connect (w->omnicancel, "clicked", G_CALLBACK (on_omni_cancel), w);
+    gtk_box_append (GTK_BOX (w->omnibuttons), w->omnicancel);
+
+    w->omnisave = gtk_button_new_with_label ("Save  (Enter)");
+    gtk_widget_add_css_class (w->omnisave, "flat");
+    gtk_widget_add_css_class (w->omnisave, "br-btn");
+    gtk_widget_set_halign (w->omnisave, GTK_ALIGN_END);
+    gtk_widget_add_css_class (w->omnisave, "br-btn-primary");
+    g_signal_connect (w->omnisave, "clicked", G_CALLBACK (on_omni_save), w);
+    gtk_box_append (GTK_BOX (w->omnibuttons), w->omnisave);
+
+    gtk_box_append (GTK_BOX (w->omni), w->omnibuttons);
 
     w->omnilist = gtk_list_box_new ();
     gtk_widget_add_css_class (w->omnilist, "br-pick-list");
@@ -3715,7 +4256,7 @@ window_new (WebKitWebView *view, gboolean primary)
     /* Top right column: URL toast on top, downloads below. The whole
      * column is click-through, so it never swallows a click on the page. */
     w->topright = gtk_box_new (GTK_ORIENTATION_VERTICAL, (int) g_theme.gap);
-    gtk_widget_set_halign (w->topright, GTK_ALIGN_END);
+    gtk_widget_set_halign (w->topright, GTK_ALIGN_FILL);
     gtk_widget_set_valign (w->topright, GTK_ALIGN_START);
     gtk_widget_set_can_target (w->topright, FALSE);
 
@@ -3998,6 +4539,10 @@ browser_main (int argc, char **argv, const BrowserApp *app)
         if (!strcmp (a, "-h") || !strcmp (a, "--help")) {
             usage (argv[0], TRUE);
             return 0;
+        } else if (!strcmp (a, "-V") || !strcmp (a, "--version")) {
+            g_print ("%s %s (build %s)\n", app->default_app_id,
+                     BROWSER_VERSION, BROWSER_BUILD);
+            return 0;
         } else if (!strcmp (a, "-q") || !strcmp (a, "--quiet")) {
             g_quiet = TRUE;
         } else if (!strcmp (a, "--title")) {
@@ -4137,7 +4682,7 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     object_set_string_if_exists (G_OBJECT (g_session), "downloads-directory", g_download_dir);
 
     history_setup (g_data_dir);
-    dlrules_setup (g_data_dir);
+    dlrules_setup (g_data_dir);      /* app wide; the profile is only migrated from */
     searches_setup (g_data_dir);
 
     setup_settings ();

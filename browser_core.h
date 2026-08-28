@@ -40,6 +40,10 @@ typedef struct {
     GtkWidget     *omniscroll;
     GtkWidget     *omnihint;    /* match count while finding               */
     GtkWidget     *omniscope;   /* page / site / everything, in the dir popup */
+    GtkWidget     *omnialways;  /* "always replace existing files"          */
+    GtkWidget     *omnibuttons; /* the confirm row, so Enter is not the only way */
+    GtkWidget     *omnisave;
+    GtkWidget     *omnicancel;
     GtkWidget     *urltoast;    /* the address, top left, on a new page     */
     guint          urltoast_id;
     GtkWidget     *keys;        /* key reference, hidden by default         */
@@ -50,6 +54,7 @@ typedef struct {
     gboolean       dl_history;  /* <mod>+D list is showing                */
     guint          dl_history_id;
     gboolean       primary;
+    gint64         dl_reveal_us;  /* a download just appeared; do not fade   */
 
     /* stored-history walk, see history.c section in browser_core.c */
     gboolean       hist_walk;    /* past the end of the session list       */
@@ -64,6 +69,11 @@ typedef struct {
     gboolean       omni_list;    /* the match list is showing              */
     gboolean       omni_setting; /* we are writing to the input ourselves  */
     char          *omni_needle;  /* what the user actually typed           */
+
+    /* the download-directory popup, while it is asking about a clash */
+    gboolean       dl_conflict;
+    char          *dl_pending_dir;
+    int            dl_pending_scope;
 
     gpointer       ext;          /* front-end state, see BrowserApp.win_* */
 } Win;
@@ -109,6 +119,13 @@ typedef struct {
 
     void     (*cleanup)       (void);
 } BrowserApp;
+
+#ifndef BROWSER_VERSION
+#define BROWSER_VERSION "0.0.0"
+#endif
+#ifndef BROWSER_BUILD
+#define BROWSER_BUILD   "unknown"
+#endif
 
 int browser_main (int argc, char **argv, const BrowserApp *app);
 
