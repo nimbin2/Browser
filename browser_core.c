@@ -64,6 +64,7 @@ static const BrowserApp *g_app;
 static GPtrArray  *g_ucms;         /* WebKitUserContentManager*, unowned */
 static const char *g_css_path;
 static char       *g_css_data;
+static gboolean    g_find_css_on;   /* the find highlight sheet is in */
 static int         g_windows;
 
 static char       *g_download_dir;
@@ -74,6 +75,7 @@ static char       *g_user_agent;
 static gboolean    g_follow_page_title = TRUE; /* see --title / --page-title */
 static char       *g_clip_cmd;     /* --clip-cmd, NULL -> wl-copy  */
 static gboolean    g_no_middle_paste = TRUE;  /* --enable-middle-click-paste */
+static gboolean    g_fix_select_all = TRUE;   /* see on_key */
 static gboolean    g_want_page_title;
 static char       *g_css_owned;    /* when --css came from the config */
 
@@ -133,6 +135,8 @@ static void       downloads_reveal  (void);
 static void       downloads_tick_start (void);
 static void       dl_panel_rebuild  (Win *w);
 static void       css_apply_one     (WebKitUserContentManager *ucm);
+static void       css_apply_all     (void);
+static void       find_highlight    (gboolean on);
 static void       history_note      (Win *w);
 
 static gboolean   parse_mod         (const char *name);
@@ -910,8 +914,10 @@ typedef struct { double r, g, b, a; } Color;
 
 typedef struct {
     /* palette, swov names */
-    Color bg, tile, tile_sel, tile_hover, card, card_hover;
+    Color bg, tile, tile_sel, tile_hover, mini_bg, card, card_hover, card_focus;
     Color text, subtext, dim, accent, hl, hltext, hint, urgent, outline;
+    Color find_hl;          /* the match <mod>+F is sitting on */
+    Color current, match, shadow;   /* carried for interchange */
 
     /* geometry */
     double radius, border, pad, gap, win_gap, ui_scale;
@@ -921,6 +927,7 @@ typedef struct {
 
     /* how wide a popup wants to be, before the window has its say */
     int   popup_w;
+    int   list_rows;        /* how many lines a popup list shows */
     char *font;        /* "" -> whatever GTK is themed with */
     char *font_mono;   /* URLs and file names read better fixed width */
 } Theme;
@@ -991,7 +998,9 @@ theme_defaults (void)
     t->tile       = rgba_hex (0x1e2733f2);
     t->tile_sel   = rgba_hex (0x26313ff2);
     t->tile_hover = rgba_hex (0x2b3644f2);
+    t->mini_bg    = rgba_hex (0x11171f9e);
     t->card       = rgba_hex (0x33404ff7);
+    t->card_focus = rgba_hex (0x3b4a5bf7);
     t->card_hover = rgba_hex (0x46566af7);
     t->hl         = rgba_hex (0xcb9b00ff);
     t->text       = rgba_hex (0xe8e8e8ff);
@@ -1002,6 +1011,10 @@ theme_defaults (void)
     t->hint       = rgba_hex (0xa7b5c4ff);
     t->urgent     = rgba_hex (0xe0533cff);
     t->outline    = rgba_hex (0x0a0e1499);
+    t->find_hl    = rgba_hex (0x9fd6f5ff);   /* pale blue, not the orange */
+    t->current    = rgba_hex (0x4fb3a5ff);
+    t->match      = rgba_hex (0xb58ae0ff);
+    t->shadow     = rgba_hex (0x00000073);
 
     t->radius   = 14.0;
     t->border   = 3.0;
@@ -1010,6 +1023,7 @@ theme_defaults (void)
     t->win_gap  = 5.0;
     t->ui_scale = 1.0;
 
+    t->list_rows = 8;
     t->popup_w  = 550;         /* about 50 characters of the mono font */
     t->ws_px    = 26;
     t->label_px = 16;
@@ -1049,11 +1063,19 @@ cfg_set (const char *k, const char *v)
 
     /* ---- palette, shared with swov ---- */
     if (key_is (k, "bg"))         return parse_color (v, &t->bg);
-    if (key_is (k, "tile") || key_is (k, "panel"))
+    if (key_is (k, "tile") || key_is (k, "panel") || key_is (k, "ring"))
                                   return parse_color (v, &t->tile);
-    if (key_is (k, "tile_sel"))   return parse_color (v, &t->tile_sel);
+    if (key_is (k, "tile_sel") || key_is (k, "ring2"))
+                                  return parse_color (v, &t->tile_sel);
     if (key_is (k, "tile_hover")) return parse_color (v, &t->tile_hover);
     if (key_is (k, "card"))       return parse_color (v, &t->card);
+    if (key_is (k, "card_focus"))  return parse_color (v, &t->card_focus);
+    if (key_is (k, "mini_bg") || key_is (k, "center"))
+                                   return parse_color (v, &t->mini_bg);
+    if (key_is (k, "current"))     return parse_color (v, &t->current);
+    if (key_is (k, "match"))       return parse_color (v, &t->match);
+    if (key_is (k, "shadow_color") || key_is (k, "shadow"))
+                                   return parse_color (v, &t->shadow);
     if (key_is (k, "card_hover") || key_is (k, "hover"))
                                   return parse_color (v, &t->card_hover);
     if (key_is (k, "text"))       return parse_color (v, &t->text);
@@ -1065,6 +1087,8 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "hint"))       return parse_color (v, &t->hint);
     if (key_is (k, "urgent"))     return parse_color (v, &t->urgent);
     if (key_is (k, "outline"))    return parse_color (v, &t->outline);
+    if (key_is (k, "find_hl") || key_is (k, "find"))
+                                  return parse_color (v, &t->find_hl);
 
     /* ---- geometry, shared with swov ---- */
     if (key_is (k, "radius") || key_is (k, "corner")) { t->radius = g_ascii_strtod (v, NULL); return TRUE; }
@@ -1080,6 +1104,7 @@ cfg_set (const char *k, const char *v)
 
     /* ---- text, shared with swov ---- */
     if (key_is (k, "popup_w") || key_is (k, "popup_width")) { t->popup_w = atoi (v); return TRUE; }
+    if (key_is (k, "list_rows") || key_is (k, "rows")) { t->list_rows = atoi (v); return TRUE; }
     if (key_is (k, "ws_px") || key_is (k, "workspace_px")) { t->ws_px    = atoi (v); return TRUE; }
     if (key_is (k, "label_px") || key_is (k, "app_px"))    { t->label_px = atoi (v); return TRUE; }
     if (key_is (k, "title_px"))                            { t->title_px = atoi (v); return TRUE; }
@@ -1100,6 +1125,7 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "no_media"))      { g_deny_media = truthy (v); return TRUE; }
     if (key_is (k, "quiet"))         { g_quiet = truthy (v); return TRUE; }
     if (key_is (k, "page_title"))    { g_want_page_title = truthy (v); return TRUE; }
+    if (key_is (k, "select_all"))    { g_fix_select_all = truthy (v); return TRUE; }
     if (key_is (k, "middle_click_paste")) { g_no_middle_paste = !truthy (v); return TRUE; }
     if (key_is (k, "always_overwrite")) {
         g_always_overwrite     = truthy (v);
@@ -1239,9 +1265,11 @@ usage (const char *argv0, gboolean to_stdout)
 
     if (hpath)
         hblock = g_strdup_printf (
-            "  Every address that came up is appended to\n"
+            "  Every address that came up is kept in\n"
             "    %s\n"
-            "  as a tab separated line: timestamp, URL, page title.\n", hpath);
+            "  as a tab separated line: timestamp, URL, page title. One line per\n"
+"  address: visiting a page again moves it to the end instead of adding\n"
+"  a second copy.\n", hpath);
     else
         hblock = g_strdup ("  Off, because --private was given.\n");
     const char *arg   = g_app->usage_arg ? g_app->usage_arg : "URL";
@@ -1249,7 +1277,10 @@ usage (const char *argv0, gboolean to_stdout)
     g_string_append_printf (s, "%s - %s\n\n", argv0, g_app->tagline);
     g_string_append_printf (s, "usage: %s [%s] [options]\n"
 "\n"
-"  With no address the window comes up blank with the history open.\n"
+"  With no address the window comes up on a start page carrying the\n"
+"  program's name, version and the three keys worth knowing. It is drawn\n"
+"  from the same palette as the panels.\n"
+"\n"
 "  A local file needs three slashes: file:///tmp/index.html. A bare path\n"
 "  works too, ./index.html or /tmp/index.html, and anything without a\n"
 "  scheme is tried as https.\n"
@@ -1306,8 +1337,8 @@ usage (const char *argv0, gboolean to_stdout)
 "                      in ~/.local/share/wkview/download-dirs.tsv, which\n"
 "                      belongs to you rather than to a profile: every\n"
 "                      profile and both browsers share it. Search keywords\n"
-"                      are per profile, in searches.tsv. A directory that does not exist is\n"
-"                      created group writable (0770)\n"
+"                      are per profile, in searches.tsv. A directory that\n"
+"                      does not exist is created group writable (0770)\n"
 "  --profile NAME      named profile, persists cookies (default: \"default\")\n"
 "  --clear-data        wipe the profile's data and cache before starting\n"
 "  --private           ephemeral session, no stored history, ignores\n"
@@ -1334,12 +1365,14 @@ usage (const char *argv0, gboolean to_stdout)
 "  ignored with a note on stderr.\n"
 "\n"
 "  look:    popup_width (how wide the panels want to be, %d)\n"
+"           list_rows (lines a popup list shows, %d)\n"
 "           bg tile tile_sel tile_hover card card_hover text subtext dim\n"
-"           accent hl hltext hint urgent outline\n"
+"           accent hl hltext hint urgent outline find_hl\n"
 "           radius border pad gap win_gap ui_scale\n"
 "           font font_mono label_px title_px hint_px\n"
 "  ours:    title app_id zoom mod clip_cmd download_dir profile private\n"
-"           no_media page_title middle_click_paste css user_agent quiet\n"
+"           no_media page_title middle_click_paste select_all css\n"
+"           user_agent quiet\n"
 "           always_overwrite\n"
 "           search_KEY (e.g. search_s = https://google.com/search?q={})\n"
 "\n"
@@ -1349,16 +1382,23 @@ usage (const char *argv0, gboolean to_stdout)
 "  -V, --version       version and build id, to tell two builds apart\n"
 "\n"
 "key bindings (<mod> = %s):\n"
-"  <mod>+O  or <mod>+L type an address. Tab or Down brings up the matching\n"
-"                      history, and with nothing typed yet, all of it.\n"
+"  <mod>+O  or <mod>+L type an address. The history is listed straight\n"
+"                      away and narrows as you type, so the two are one\n"
+"                      thing: pick a line, or press Enter and what you\n"
+"                      typed is loaded\n"
 "                      A search keyword in front runs a search instead:\n"
 "                      \"s tree\" with s = https://google.com/search?q={}\n"
 "  <mod>+H             the same popup, opened on the history\n"
-"  <mod>+F             find in the page. Enter for the next hit,\n"
-"                      Shift+Enter for the previous, Esc to stop\n"
+"  <mod>+F             find in the page. Enter, Down or <mod>+N for the\n"
+"                      next hit, Shift+Enter, Up or <mod>+Shift+N for the\n"
+"                      previous, Esc to stop. The hit you are on is shown\n"
+"                      in find_hl, a pale blue by default\n"
 "  <mod>+S             download directory. The select decides how far it\n"
 "                      reaches: this address only, everything on the site,\n"
-"                      or everything. The narrower rule wins, and a rule\n"
+"                      or everything. The popup lists what is already\n"
+"                      stored: arrows or the mouse pick one, Delete or\n"
+"                      <mod>+X drops the rule under the cursor.\n"
+"                      The narrower rule wins, and a rule\n"
 "                      set on a page also covers the files it hands out.\n"
 "                      If something else already points at that directory\n"
 "                      you are asked: Enter drops the older rule, Esc lets\n"
@@ -1367,8 +1407,11 @@ usage (const char *argv0, gboolean to_stdout)
 "                      ask for, with no question. \"everything\" lasts for\n"
 "                      this run only; put download_dir in a config file to\n"
 "                      keep it\n"
-"  <mod>+K             add a search keyword, as \"g URL\" with {} where the\n"
-"                      words go\n"
+"  <mod>+K             search keywords. The popup lists the ones it knows;\n"
+"                      add one as \"g URL\" with {} where the words go, and\n"
+"                      drop the one under the cursor with Delete or\n"
+"                      <mod>+X. Then \"g tree\" in the address popup\n"
+"                      searches for tree\n"
 "  F1  or  <mod>+/     the key list, on screen\n"
 "  <mod>+J             back: one page back, then on into the stored history\n"
 "  <mod>+Shift+J       forward, the same way round\n"
@@ -1377,8 +1420,8 @@ usage (const char *argv0, gboolean to_stdout)
 "  keys named on them, so Enter is never the only way in.\n"
 "\n"
 "  In the popup: Tab and Down walk forward through the matches, Shift+Tab\n"
-"  and Up back, the wheel scrolls, a click opens, Delete removes the entry\n"
-"  from the history. Whatever is selected is written into the input, so\n"
+"  and Up back, the wheel scrolls, a click opens, Delete or <mod>+X removes\n"
+"  the entry. Whatever is selected is written into the input, so\n"
 "  Enter always loads what you can read. Esc, <mod>+H or a click outside\n"
 "  closes it.\n"
 "\n"
@@ -1394,7 +1437,7 @@ usage (const char *argv0, gboolean to_stdout)
 "  <mod>+minus         zoom out\n"
 "  <mod>+0             reset zoom to 100%%\n"
 "  <mod>+Y             copy the current URL, and show what was copied\n",
-        hblock, HIST_KEEP, cfg_shared, cfg_own, g_theme.popup_w,
+        hblock, HIST_KEEP, cfg_shared, cfg_own, g_theme.popup_w, g_theme.list_rows,
         g_mod_name, DL_HISTORY_SECONDS, URL_TOAST_SECONDS);
 
     if (g_app->usage_keys)
@@ -1406,8 +1449,10 @@ usage (const char *argv0, gboolean to_stdout)
 "  message - and reaches the page only when nothing of ours is up.\n"
 "\n"
 "  Only the combinations listed above are intercepted; everything else\n"
-"  (<mod>+A, <mod>+C, <mod>+V, ...) goes straight to the page, so select-all\n"
-"  and copy/paste keep working inside input fields. While the URL bar is\n"
+"  (<mod>+C, <mod>+V, ...) goes straight to the page, so copy and paste\n"
+"  keep working inside input fields. <mod>+A is turned into WebKit's\n"
+"  select-all, because WebKit itself reads it as move-to-start-of-line;\n"
+"  set select_all=no if a page needs the key for itself. While the URL bar is\n"
 "  open every key except Esc belongs to it, so <mod>+A selects its text.\n"
 "%s",
         g_mod == GDK_CONTROL_MASK
@@ -1438,10 +1483,43 @@ usage_short (const char *argv0)
 
 /* User stylesheet injected into the pages (--css). One content manager
  * per view, so the sheet has to be applied to each of them. */
+/*
+ * WebKit shows the match it is sitting on as the document selection, so
+ * colouring ::selection is what colours the current hit. The sheet only
+ * goes in while <mod>+F is open, so ordinary selections keep the page's
+ * own colours the rest of the time.
+ */
+static void
+css_apply_find (WebKitUserContentManager *ucm)
+{
+    if (!g_find_css_on)
+        return;
+
+    char *bg  = css_rgba (g_theme.find_hl);
+    char *fg  = css_rgba (g_theme.hltext);
+    char *css = g_strdup_printf ("::selection{background-color:%s;color:%s}"
+                                 "::-moz-selection{background-color:%s;color:%s}",
+                                 bg, fg, bg, fg);
+
+    WebKitUserStyleSheet *ss =
+        webkit_user_style_sheet_new (css,
+                                     WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                                     WEBKIT_USER_STYLE_LEVEL_USER,
+                                     NULL, NULL);
+    webkit_user_content_manager_add_style_sheet (ucm, ss);
+    webkit_user_style_sheet_unref (ss);
+
+    g_free (css);
+    g_free (fg);
+    g_free (bg);
+}
+
 static void
 css_apply_one (WebKitUserContentManager *ucm)
 {
     webkit_user_content_manager_remove_all_style_sheets (ucm);
+    css_apply_find (ucm);
+
     if (!g_css_data)
         return;
 
@@ -1452,6 +1530,13 @@ css_apply_one (WebKitUserContentManager *ucm)
                                      NULL, NULL);
     webkit_user_content_manager_add_style_sheet (ucm, ss);
     webkit_user_style_sheet_unref (ss);
+}
+
+static void
+css_apply_all (void)
+{
+    for (guint i = 0; i < g_ucms->len; i++)
+        css_apply_one (g_ptr_array_index (g_ucms, i));
 }
 
 void
@@ -1470,8 +1555,7 @@ css_reload (void)
         }
     }
 
-    for (guint i = 0; i < g_ucms->len; i++)
-        css_apply_one (g_ptr_array_index (g_ucms, i));
+    css_apply_all ();
 }
 
 /*
@@ -1489,6 +1573,8 @@ ui_css_install (void)
     char *c_sel     = css_rgba (t->tile_sel);
     char *c_hover   = css_rgba (t->tile_hover);
     char *c_card    = css_rgba (t->card);
+    char *c_mini    = css_rgba (t->mini_bg);
+    char *c_current = css_rgba (t->current);
     char *c_text    = css_rgba (t->text);
     char *c_subtext = css_rgba (t->subtext);
     char *c_dim     = css_rgba (t->dim);
@@ -1561,6 +1647,7 @@ ui_css_install (void)
         "label.br-pick-sub { color: %s; %s font-size: %.0fpx; }"
         "label.br-dl-name { color: %s; %s font-size: %.0fpx; }"
         "label.br-dl-status { color: %s; %s font-size: %.0fpx; }"
+        "label.br-dl-live { color: %s; %s font-size: %.0fpx; }"
         "label.br-dl-ask { color: %s; %s font-size: %.0fpx; }"
         "label.br-dl-failed { color: %s; %s font-size: %.0fpx; }"
         "label.br-dl-dir { color: %s; %s font-size: %.0fpx; }"
@@ -1588,6 +1675,7 @@ ui_css_install (void)
         c_subtext, mono_font, t->title_px * s,
         c_text, mono_font, t->label_px * s,
         c_subtext, mono_font, t->title_px * s,
+        c_current, mono_font, t->title_px * s,
         c_hl, mono_font, t->title_px * s,
         c_urgent, mono_font, t->title_px * s,
         c_dim, mono_font, t->title_px * s,
@@ -1641,8 +1729,21 @@ ui_css_install (void)
         "  background-color: %s; border: none;"
         "  border-radius: %.0fpx; min-height: %.0fpx;"
         "}",
-        c_card, t->radius / 3.0, 6.0 * s,
+        c_mini, t->radius / 3.0, 6.0 * s,
         c_hl,   t->radius / 3.0, 6.0 * s);
+
+    /* ---- the loading hairline, across the very top ---- */
+    g_string_append_printf (css,
+        "progressbar.br-load, progressbar.br-load > trough {"
+        "  background-color: transparent; background-image: none;"
+        "  border: none; border-radius: 0; min-height: %.0fpx;"
+        "  padding: 0; margin: 0;"
+        "}"
+        "progressbar.br-load > trough > progress {"
+        "  background-color: %s; border: none; border-radius: 0;"
+        "  min-height: %.0fpx;"
+        "}",
+        3.0 * s, c_hl, 3.0 * s);
 
     /* ---- picker rows ---- */
     g_string_append_printf (css,
@@ -1680,6 +1781,7 @@ ui_css_install (void)
     g_free (c_dim);     g_free (c_hl);      g_free (c_hint);
     g_free (c_urgent);  g_free (c_outline);  g_free (c_hltext);
     g_free (c_hl_soft); g_free (c_hl_dim);
+    g_free (c_mini);    g_free (c_current);
 }
 
 /* ----------------------------------------------------------- clipboard */
@@ -2273,108 +2375,54 @@ history_load (void)
     if (n > HIST_KEEP)
         first = n - HIST_KEEP;
 
-    GString *kept = g_string_new (NULL);
+    /*
+     * One line per address, keeping the newest visit. Files written before
+     * this rule existed are full of repeats, so the cleanup happens here
+     * rather than only on the way in - the file is tidied on first read.
+     */
+    GHashTable *seen = g_hash_table_new (g_str_hash, g_str_equal);
+    GPtrArray  *keep = g_ptr_array_new ();   /* line indices, newest first */
 
-    for (guint i = first; i < n; i++) {
-        char **f = g_strsplit (lines[i], "\t", 3);
-        if (g_strv_length (f) >= 2 && history_uri_ok (f[1])) {
-            hist_add (f[1], g_strv_length (f) >= 3 ? f[2] : "");
-            g_string_append (kept, lines[i]);
-            g_string_append_c (kept, '\n');
+    for (guint i = n; i > first; i--) {
+        char **f = g_strsplit (lines[i - 1], "\t", 3);
+
+        if (g_strv_length (f) >= 2 && history_uri_ok (f[1]) &&
+            !g_hash_table_contains (seen, f[1])) {
+            g_hash_table_add (seen, g_strdup (f[1]));
+            g_ptr_array_add (keep, GUINT_TO_POINTER (i - 1));
         }
         g_strfreev (f);
     }
 
-    if (first > 0)
+    GString *kept  = g_string_new (NULL);
+    guint    dropped = 0;
+
+    for (guint i = keep->len; i > 0; i--) {          /* back into file order */
+        guint  idx = GPOINTER_TO_UINT (g_ptr_array_index (keep, i - 1));
+        char **f   = g_strsplit (lines[idx], "\t", 3);
+
+        hist_add (f[1], g_strv_length (f) >= 3 ? f[2] : "");
+        g_string_append (kept, lines[idx]);
+        g_string_append_c (kept, '\n');
+        g_strfreev (f);
+    }
+
+    dropped = (n - first) - keep->len;
+
+    if (first > 0 || dropped > 0)
         g_file_set_contents (g_hist_path, kept->str, -1, NULL);
+
+    if (dropped)
+        LOG ("history: dropped %u duplicate lines\n", dropped);
+
+    g_ptr_array_free (keep, TRUE);
+    g_hash_table_destroy (seen);
 
     g_string_free (kept, TRUE);
     g_strfreev (lines);
     g_free (data);
 
     LOG ("history: %u entries from %s\n", g_hist->len, g_hist_path);
-}
-
-static void
-history_append (const char *uri, const char *title)
-{
-    if (!g_hist_path)
-        return;
-
-    /* reloads and in-page jumps should not pile up */
-    if (g_hist->len && !g_strcmp0 (hist_at (g_hist->len - 1)->uri, uri))
-        return;
-
-    char *t = history_clean (title);
-    hist_add (uri, t);
-
-    GDateTime *now  = g_date_time_new_now_local ();
-    char      *when = g_date_time_format_iso8601 (now);
-    FILE      *f    = g_fopen (g_hist_path, "a");
-
-    if (f) {
-        fprintf (f, "%s\t%s\t%s\n", when, uri, t);
-        fclose (f);
-    } else {
-        g_printerr ("history: cannot write %s: %s\n", g_hist_path, g_strerror (errno));
-    }
-
-    g_free (t);
-    g_free (when);
-    g_date_time_unref (now);
-}
-
-static void
-history_setup (const char *data_dir)
-{
-    g_hist = g_ptr_array_new_with_free_func (hist_entry_free);
-
-    if (g_private || !data_dir) {
-        LOG ("history: off\n");
-        return;
-    }
-
-    g_hist_path = g_build_filename (data_dir, HIST_FILE, NULL);
-    history_load ();
-}
-
-/* The <title> is often still empty when the load finishes, so the record
- * is written a moment later. It also debounces redirect chains. */
-static gboolean
-history_write (gpointer u)
-{
-    Win *w = u;
-    w->hist_id = 0;
-
-    const char *uri = webkit_web_view_get_uri (w->view);
-    if (!history_uri_ok (uri))
-        return G_SOURCE_REMOVE;
-    if (g_app->history_skip && g_app->history_skip (uri))
-        return G_SOURCE_REMOVE;         /* a front-end's internal page */
-
-    history_append (uri, webkit_web_view_get_title (w->view));
-    w->hist_pos = (int) g_hist->len - 1;
-    return G_SOURCE_REMOVE;
-}
-
-/* Called when a load settles. Records the page unless we navigated there
- * ourselves, in which case the cursor is already where it belongs. */
-static void
-history_note (Win *w)
-{
-    if (w->hist_loading) {
-        w->hist_loading = FALSE;
-        return;
-    }
-
-    w->hist_walk = FALSE;               /* the user went somewhere new */
-
-    if (w->load_failed)
-        return;
-
-    if (w->hist_id)
-        g_source_remove (w->hist_id);
-    w->hist_id = g_timeout_add (HIST_SETTLE_MS, history_write, w);
 }
 
 /*
@@ -2486,6 +2534,36 @@ urltoast_show (Win *w, const char *uri)
     w->urltoast_id = g_timeout_add_seconds (URL_TOAST_SECONDS, urltoast_timeout, w);
 }
 
+/* The title only turns up part way through the load, so the label starts
+ * as the address and is upgraded in place when the name arrives. */
+static void
+on_title_toast (GObject *obj, GParamSpec *ps, gpointer u)
+{
+    (void) ps; (void) u;
+    WebKitWebView *view = WEBKIT_WEB_VIEW (obj);
+    Win           *w    = win_of (view);
+    const char    *t    = webkit_web_view_get_title (view);
+
+    if (w && t && *t && gtk_widget_get_visible (w->urltoast))
+        gtk_label_set_text (GTK_LABEL (w->urltoast), t);
+}
+
+static void
+on_load_progress (GObject *obj, GParamSpec *ps, gpointer u)
+{
+    (void) ps; (void) u;
+    WebKitWebView *view = WEBKIT_WEB_VIEW (obj);
+    Win           *w    = win_of (view);
+
+    if (!w)
+        return;
+
+    double p = webkit_web_view_get_estimated_load_progress (view);
+
+    gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (w->loadbar), p);
+    gtk_widget_set_visible (w->loadbar, p > 0.0 && p < 1.0);
+}
+
 static void
 on_load_core (WebKitWebView *view, WebKitLoadEvent ev, gpointer u)
 {
@@ -2500,6 +2578,7 @@ on_load_core (WebKitWebView *view, WebKitLoadEvent ev, gpointer u)
     } else if (ev == WEBKIT_LOAD_COMMITTED) {
         urltoast_show (w, webkit_web_view_get_uri (view));   /* after redirects */
     } else if (ev == WEBKIT_LOAD_FINISHED) {
+        gtk_widget_set_visible (w->loadbar, FALSE);
         history_note (w);
     }
 }
@@ -2545,6 +2624,124 @@ omni_matches (const HistEntry *e, const char *needle)
     return hit;
 }
 
+/* One row shape for both lists: a strong line and a quiet one under it. */
+static GtkWidget *
+omni_row_new (const char *main_text, const char *sub_text)
+{
+    GtkWidget *row = gtk_list_box_row_new ();
+    GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *main_l = gtk_label_new (main_text);
+    gtk_widget_add_css_class (main_l, "br-pick-main");
+    gtk_label_set_xalign (GTK_LABEL (main_l), 0.0);
+    gtk_label_set_ellipsize (GTK_LABEL (main_l), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_box_append (GTK_BOX (box), main_l);
+
+    if (sub_text && *sub_text) {
+        GtkWidget *sub = gtk_label_new (sub_text);
+        gtk_widget_add_css_class (sub, "br-pick-sub");
+        gtk_label_set_xalign (GTK_LABEL (sub), 0.0);
+        gtk_label_set_ellipsize (GTK_LABEL (sub), PANGO_ELLIPSIZE_MIDDLE);
+        gtk_box_append (GTK_BOX (box), sub);
+    }
+
+    gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), box);
+    return row;
+}
+
+static void
+omni_empty_row (Win *w, const char *text)
+{
+    GtkWidget *row = gtk_list_box_row_new ();
+    GtkWidget *l   = gtk_label_new (text);
+
+    gtk_widget_add_css_class (l, "br-pick-sub");
+    gtk_label_set_xalign (GTK_LABEL (l), 0.0);
+    gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), l);
+    gtk_list_box_row_set_selectable (GTK_LIST_BOX_ROW (row), FALSE);
+    gtk_list_box_append (GTK_LIST_BOX (w->omnilist), row);
+}
+
+/* The directory popup lists what is already stored, so a directory can be
+ * picked instead of typed, and dropped with Delete. */
+static void
+omni_rebuild_rules (Win *w, const char *needle)
+{
+    GList *keys = g_hash_table_get_keys (g_dlrules);
+    guint  shown = 0;
+
+    keys = g_list_sort (keys, (GCompareFunc) g_strcmp0);
+
+    for (GList *l = keys; l; l = l->next) {
+        const char *key = l->data;
+        const char *dir = g_hash_table_lookup (g_dlrules, key);
+
+        if (needle && *needle) {
+            char    *k = g_utf8_casefold (key, -1);
+            char    *d = g_utf8_casefold (dir, -1);
+            gboolean hit = strstr (k, needle) || strstr (d, needle);
+            g_free (k);
+            g_free (d);
+            if (!hit)
+                continue;
+        }
+
+        gboolean always = dl_always_for_key (key);
+        char    *sub    = g_strdup_printf ("%s%s", key, always ? "   (always replaces)" : "");
+        GtkWidget *row  = omni_row_new (dir, sub);
+
+        g_object_set_data_full (G_OBJECT (row), "rule", g_strdup (key), g_free);
+        gtk_list_box_append (GTK_LIST_BOX (w->omnilist), row);
+        g_free (sub);
+        shown++;
+    }
+
+    g_list_free (keys);
+
+    if (shown == 0)
+        omni_empty_row (w, g_hash_table_size (g_dlrules)
+                        ? "no match" : "no directories stored yet");
+}
+
+/* <mod>+K lists the keywords it already knows, the same way the directory
+ * popup lists its rules. */
+static void
+omni_rebuild_searches (Win *w, const char *needle)
+{
+    GList *keys  = g_searches ? g_hash_table_get_keys (g_searches) : NULL;
+    guint  shown = 0;
+
+    keys = g_list_sort (keys, (GCompareFunc) g_strcmp0);
+
+    for (GList *l = keys; l; l = l->next) {
+        const char *key = l->data;
+        const char *url = g_hash_table_lookup (g_searches, key);
+
+        if (needle && *needle) {
+            char    *k = g_utf8_casefold (key, -1);
+            char    *u = g_utf8_casefold (url, -1);
+            gboolean hit = strstr (k, needle) || strstr (u, needle);
+            g_free (k);
+            g_free (u);
+            if (!hit)
+                continue;
+        }
+
+        char      *main_text = g_strdup_printf ("%s   %s", key, url);
+        GtkWidget *row       = omni_row_new (main_text, NULL);
+
+        g_object_set_data_full (G_OBJECT (row), "search", g_strdup (key), g_free);
+        gtk_list_box_append (GTK_LIST_BOX (w->omnilist), row);
+        g_free (main_text);
+        shown++;
+    }
+
+    g_list_free (keys);
+
+    if (shown == 0)
+        omni_empty_row (w, "no keywords yet - type one as: g https://host/?q={}");
+}
+
 static void
 omni_rebuild (Win *w)
 {
@@ -2555,44 +2752,33 @@ omni_rebuild (Win *w)
     char *needle = g_utf8_casefold (w->omni_needle ? w->omni_needle : "", -1);
     guint shown  = 0;
 
+    if (w->omni_mode == OMNI_DLDIR) {
+        omni_rebuild_rules (w, needle);
+        g_free (needle);
+        return;
+    }
+
+    if (w->omni_mode == OMNI_SEARCH) {
+        omni_rebuild_searches (w, needle);
+        g_free (needle);
+        return;
+    }
+
     /* newest first: what you want in a history list */
     for (guint i = g_hist->len; i > 0 && shown < PICK_ROWS; i--) {
         HistEntry *e = hist_at (i - 1);
         if (!omni_matches (e, needle))
             continue;
 
-        GtkWidget *row = gtk_list_box_row_new ();
-        GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-
-        GtkWidget *main_l = gtk_label_new (*e->title ? e->title : e->uri);
-        gtk_widget_add_css_class (main_l, "br-pick-main");
-        gtk_label_set_xalign (GTK_LABEL (main_l), 0.0);
-        gtk_label_set_ellipsize (GTK_LABEL (main_l), PANGO_ELLIPSIZE_END);
-        gtk_box_append (GTK_BOX (box), main_l);
-
-        if (*e->title) {
-            GtkWidget *sub = gtk_label_new (e->uri);
-            gtk_widget_add_css_class (sub, "br-pick-sub");
-            gtk_label_set_xalign (GTK_LABEL (sub), 0.0);
-            gtk_label_set_ellipsize (GTK_LABEL (sub), PANGO_ELLIPSIZE_MIDDLE);
-            gtk_box_append (GTK_BOX (box), sub);
-        }
-
-        gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), box);
+        GtkWidget *row = omni_row_new (*e->title ? e->title : e->uri,
+                                       *e->title ? e->uri : NULL);
         g_object_set_data (G_OBJECT (row), "pos", GINT_TO_POINTER ((int) i - 1));
         gtk_list_box_append (GTK_LIST_BOX (w->omnilist), row);
         shown++;
     }
 
-    if (shown == 0) {
-        GtkWidget *row = gtk_list_box_row_new ();
-        GtkWidget *l   = gtk_label_new (g_hist->len ? "no match" : "no history yet");
-        gtk_widget_add_css_class (l, "br-pick-sub");
-        gtk_label_set_xalign (GTK_LABEL (l), 0.0);
-        gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), l);
-        gtk_list_box_row_set_selectable (GTK_LIST_BOX_ROW (row), FALSE);
-        gtk_list_box_append (GTK_LIST_BOX (w->omnilist), row);
-    }
+    if (shown == 0)
+        omni_empty_row (w, g_hist->len ? "no match" : "no history yet");
 
     g_free (needle);
 }
@@ -2620,6 +2806,100 @@ omni_scroll_to (Win *w, GtkListBoxRow *row)
         gtk_adjustment_set_value (adj, bot - page);
 }
 
+static void
+history_append (const char *uri, const char *title)
+{
+    if (!g_hist_path)
+        return;
+
+    /* One line per address. Visiting a page again moves it to the end
+     * rather than adding a second copy, so the list stays a set and the
+     * newest visit is the one you scroll to first. */
+    int seen = -1;
+    for (guint i = 0; i < g_hist->len; i++)
+        if (!g_strcmp0 (hist_at (i)->uri, uri)) {
+            seen = (int) i;
+            break;
+        }
+
+    if (seen >= 0 && seen == (int) g_hist->len - 1)
+        return;                        /* already the newest, nothing to do */
+
+    if (seen >= 0)
+        history_delete (seen);         /* drops it from the file too */
+
+    char *t = history_clean (title);
+    hist_add (uri, t);
+
+    GDateTime *now  = g_date_time_new_now_local ();
+    char      *when = g_date_time_format_iso8601 (now);
+    FILE      *f    = g_fopen (g_hist_path, "a");
+
+    if (f) {
+        fprintf (f, "%s\t%s\t%s\n", when, uri, t);
+        fclose (f);
+    } else {
+        g_printerr ("history: cannot write %s: %s\n", g_hist_path, g_strerror (errno));
+    }
+
+    g_free (t);
+    g_free (when);
+    g_date_time_unref (now);
+}
+
+static void
+history_setup (const char *data_dir)
+{
+    g_hist = g_ptr_array_new_with_free_func (hist_entry_free);
+
+    if (g_private || !data_dir) {
+        LOG ("history: off\n");
+        return;
+    }
+
+    g_hist_path = g_build_filename (data_dir, HIST_FILE, NULL);
+    history_load ();
+}
+
+/* The <title> is often still empty when the load finishes, so the record
+ * is written a moment later. It also debounces redirect chains. */
+static gboolean
+history_write (gpointer u)
+{
+    Win *w = u;
+    w->hist_id = 0;
+
+    const char *uri = webkit_web_view_get_uri (w->view);
+    if (!history_uri_ok (uri))
+        return G_SOURCE_REMOVE;
+    if (g_app->history_skip && g_app->history_skip (uri))
+        return G_SOURCE_REMOVE;         /* a front-end's internal page */
+
+    history_append (uri, webkit_web_view_get_title (w->view));
+    w->hist_pos = (int) g_hist->len - 1;
+    return G_SOURCE_REMOVE;
+}
+
+/* Called when a load settles. Records the page unless we navigated there
+ * ourselves, in which case the cursor is already where it belongs. */
+static void
+history_note (Win *w)
+{
+    if (w->hist_loading) {
+        w->hist_loading = FALSE;
+        return;
+    }
+
+    w->hist_walk = FALSE;               /* the user went somewhere new */
+
+    if (w->load_failed)
+        return;
+
+    if (w->hist_id)
+        g_source_remove (w->hist_id);
+    w->hist_id = g_timeout_add (HIST_SETTLE_MS, history_write, w);
+}
+
 /* Delete in the popup: drop the selected row and keep the place. */
 static void
 omni_delete_selected (Win *w)
@@ -2630,8 +2910,22 @@ omni_delete_selected (Win *w)
     if (!row || !gtk_list_box_row_get_selectable (row))
         return;
 
-    int idx = gtk_list_box_row_get_index (row);
-    history_delete (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "pos")));
+    int         idx  = gtk_list_box_row_get_index (row);
+    const char *rule = g_object_get_data (G_OBJECT (row), "rule");
+
+    const char *search = g_object_get_data (G_OBJECT (row), "search");
+
+    if (search) {
+        LOG ("search: dropped %s\n", search);
+        g_hash_table_remove (g_searches, search);
+        searches_save ();
+    } else if (rule) {
+        LOG ("download: dropped rule %s\n", rule);
+        dl_dir_forget (rule);
+        dlrules_save ();
+    } else {
+        history_delete (GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "pos")));
+    }
 
     omni_rebuild (w);
 
@@ -2652,30 +2946,68 @@ omni_reflect (Win *w, GtkListBoxRow *row)
     if (!row || !gtk_list_box_row_get_selectable (row))
         return;
 
-    int pos = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "pos"));
-    if (pos < 0 || pos >= (int) g_hist->len)
-        return;
+    const char *text;
+    char       *owned  = NULL;
+    const char *search = g_object_get_data (G_OBJECT (row), "search");
+    const char *rule   = g_object_get_data (G_OBJECT (row), "rule");
+
+    if (search) {
+        const char *url = g_hash_table_lookup (g_searches, search);
+        if (!url)
+            return;
+        owned = g_strdup_printf ("%s %s", search, url);
+        text  = owned;
+    } else if (rule) {
+        text = g_hash_table_lookup (g_dlrules, rule);   /* its directory */
+        if (!text)
+            return;
+    } else {
+        int pos = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "pos"));
+        if (pos < 0 || pos >= (int) g_hist->len)
+            return;
+        text = hist_at (pos)->uri;
+    }
 
     w->omni_setting = TRUE;
-    gtk_editable_set_text (GTK_EDITABLE (w->omnientry), hist_at (pos)->uri);
+    gtk_editable_set_text (GTK_EDITABLE (w->omnientry), text);
     gtk_editable_set_position (GTK_EDITABLE (w->omnientry), -1);
     w->omni_setting = FALSE;
+
+    g_free (owned);
 }
 
-/* The list is worth as much of the window as it can decently have: a
- * fixed cap looked cramped on anything but a small screen. */
+/*
+ * A fixed number of lines, measured from a real row rather than guessed,
+ * so the box is the same height whether the history has four entries or
+ * four hundred. Min and max are set together: a list that grows and
+ * shrinks as you type is harder to read than one that stays put.
+ */
 static void
 omni_size_list (Win *w)
 {
-    int h = gtk_widget_get_height (w->win);
+    int rows  = g_theme.list_rows > 0 ? g_theme.list_rows : 8;
+    int row_h = 0;
 
-    if (h <= 0)
-        h = 800;                        /* not mapped yet, assume the default */
+    GtkListBoxRow *first = gtk_list_box_get_row_at_index (GTK_LIST_BOX (w->omnilist), 0);
+    if (first) {
+        int min_h, nat_h;
+        gtk_widget_measure (GTK_WIDGET (first), GTK_ORIENTATION_VERTICAL, -1,
+                            &min_h, &nat_h, NULL, NULL);
+        row_h = nat_h;
+    }
 
-    gtk_scrolled_window_set_min_content_height (GTK_SCROLLED_WINDOW (w->omniscroll),
-                                                MIN (320, (int) (h * 0.35)));
-    gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (w->omniscroll),
-                                                (int) (h * 0.68));
+    if (row_h <= 0)                    /* nothing built yet, estimate */
+        row_h = (int) ((g_theme.label_px + g_theme.title_px) * g_theme.ui_scale
+                       + g_theme.win_gap);
+
+    int want = rows * row_h;
+    int win_h = gtk_widget_get_height (w->win);
+
+    if (win_h > 0)
+        want = MIN (want, (int) (win_h * 0.7));
+
+    gtk_scrolled_window_set_min_content_height (GTK_SCROLLED_WINDOW (w->omniscroll), want);
+    gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (w->omniscroll), want);
 }
 
 static void
@@ -2684,8 +3016,8 @@ omni_list_show (Win *w)
     if (w->omni_list)
         return;
 
-    omni_size_list (w);
     omni_rebuild (w);
+    omni_size_list (w);                /* after the rows exist, so one can be measured */
     gtk_widget_set_visible (w->omniscroll, TRUE);
     w->omni_list = TRUE;
 }
@@ -2723,8 +3055,10 @@ omni_hide (Win *w)
     if (!gtk_widget_get_visible (w->omni))
         return;
 
-    if (w->omni_mode == OMNI_FIND)
+    if (w->omni_mode == OMNI_FIND) {
         webkit_find_controller_search_finish (webkit_web_view_get_find_controller (w->view));
+        find_highlight (FALSE);
+    }
 
     gtk_widget_set_visible (w->omni, FALSE);
     gtk_widget_set_visible (w->omniscroll, FALSE);
@@ -2816,8 +3150,14 @@ omni_show (Win *w, OmniMode mode)
 
     if (mode == OMNI_URL)
         gtk_editable_select_region (GTK_EDITABLE (w->omnientry), 0, -1);
-    else if (mode == OMNI_HISTORY)
-        omni_list_show (w);
+
+    if (mode == OMNI_URL || mode == OMNI_HISTORY)
+        omni_list_show (w);            /* the history is worth seeing unasked */
+
+    if (mode == OMNI_FIND)
+        find_highlight (TRUE);
+    else if (mode == OMNI_DLDIR || mode == OMNI_SEARCH)
+        omni_list_show (w);            /* what is already stored */
 }
 
 static void
@@ -2870,6 +3210,17 @@ omni_go (Win *w)
                    WEBKIT_FIND_OPTIONS_WRAP_AROUND)
 
 /* WebKit scrolls the hit into view for us. */
+/* The sheet is only worth injecting while the find bar is up. */
+static void
+find_highlight (gboolean on)
+{
+    if (g_find_css_on == on)
+        return;
+
+    g_find_css_on = on;
+    css_apply_all ();
+}
+
 static void
 find_run (Win *w)
 {
@@ -3102,7 +3453,12 @@ on_omni_changed (GtkEditable *e, gpointer u)
         return;
     }
 
-    if (w->omni_list)
+    /* Typing an address searches the history at the same time: the two
+     * were never really different jobs. Enter still loads what is typed,
+     * so a page that is not in the list is one keystroke away either way. */
+    if (!w->omni_list && w->omni_mode == OMNI_URL && *w->omni_needle)
+        omni_list_show (w);
+    else if (w->omni_list)
         omni_rebuild (w);
 }
 
@@ -3113,7 +3469,11 @@ on_omni_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer u)
     Win *w = u;
 
     omni_reflect (w, row);
-    omni_go (w);
+
+    /* in the directory popup a click chooses the directory; Save still
+     * has to be pressed, since the scope has to be right too */
+    if (w->omni_mode != OMNI_DLDIR)
+        omni_go (w);
 }
 
 /* --------------------------------------------------------------- toast */
@@ -3240,6 +3600,7 @@ dl_row_new (Dl *d)
     gtk_widget_add_css_class (status_l,
                               d->state == DL_FAILED ? "br-dl-failed"
                             : d->state == DL_ASK    ? "br-dl-ask"
+                            : d->state == DL_ACTIVE ? "br-dl-live"
                                                     : "br-dl-status");
     gtk_label_set_xalign (GTK_LABEL (status_l), 1.0);
     gtk_widget_set_halign (status_l, GTK_ALIGN_END);
@@ -3634,6 +3995,15 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
     }
 
     if (gtk_widget_get_visible (w->omni)) {
+        /* Select-all, whatever GTK's key theme has to say about it: with
+         * the Emacs bindings <mod>+A is beginning-of-line, which is not
+         * what anyone expects from a text field. */
+        if (mod && !shift && key == GDK_KEY_a) {
+            gtk_editable_select_region (GTK_EDITABLE (w->omnientry), 0, -1);
+            return TRUE;
+        }
+
+
         if ((mod && ((key == GDK_KEY_h && w->omni_mode == OMNI_HISTORY) ||
                      (key == GDK_KEY_f && w->omni_mode == OMNI_FIND) ||
                      (key == GDK_KEY_s && w->omni_mode == OMNI_DLDIR) ||
@@ -3642,20 +4012,33 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
             return TRUE;
         }
 
-        /* finding: Enter walks the hits, there is no list to steer */
+        /* finding: several ways to walk the hits, since the hands are
+         * already on the keyboard and everyone reaches for a different one */
         if (w->omni_mode == OMNI_FIND) {
-            if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter ||
+                (mod && key == GDK_KEY_n)) {
                 find_step (w, shift ? -1 : +1);
+                return TRUE;
+            }
+            if (keyval == GDK_KEY_Down || keyval == GDK_KEY_KP_Down) {
+                find_step (w, +1);
+                return TRUE;
+            }
+            if (keyval == GDK_KEY_Up || keyval == GDK_KEY_KP_Up) {
+                find_step (w, -1);
                 return TRUE;
             }
             return FALSE;
         }
 
-        /* settings modes: no list to steer, Enter applies */
-        if (w->omni_mode == OMNI_DLDIR || w->omni_mode == OMNI_SEARCH)
+        /* the keyword popup has no list to steer */
+        if (w->omni_mode == OMNI_SEARCH)
             return FALSE;
 
-        if (keyval == GDK_KEY_Delete || keyval == GDK_KEY_KP_Delete) {
+        /* Delete is missing from plenty of keyboards, so <mod>+X does the
+         * same thing wherever an entry can be dropped. */
+        if (keyval == GDK_KEY_Delete || keyval == GDK_KEY_KP_Delete ||
+            (mod && key == GDK_KEY_x)) {
             omni_delete_selected (w);
             return TRUE;
         }
@@ -3771,6 +4154,17 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
         clipboard_copy (w, webkit_web_view_get_uri (w->view));
         return TRUE;
 
+    /* WebKitGTK maps <mod>+A to MoveToBeginningOfLine, an Emacs habit that
+     * surprises everyone typing into a web text field. The editing command
+     * is what the key is supposed to do, so run that instead. Turn it off
+     * with select_all=no for pages that bind <mod>+A themselves. */
+    case GDK_KEY_a:
+        if (shift || !g_fix_select_all)
+            break;
+        webkit_web_view_execute_editing_command (w->view,
+                                                 WEBKIT_EDITING_COMMAND_SELECT_ALL);
+        return TRUE;
+
     /* '+' usually needs Shift, and some layouts send '=' or the keypad key */
     case GDK_KEY_plus:
     case GDK_KEY_equal:
@@ -3822,11 +4216,13 @@ static const KeyRow g_keyrows[] = {
     { "Tab / Down",   "next match" },
     { "Shift+Tab / Up", "previous match" },
     { "Enter",        "open" },
-    { "Delete",       "remove the entry from the history" },
+    { "Delete / %s+X", "remove the entry under the cursor" },
     { "Esc",          "close" },
 
     { NULL, "page" },
-    { "%s+F",         "find, Enter next, Shift+Enter previous" },
+    { "%s+F",         "find in the page" },
+    { "Enter / Down / %s+N", "next match, while finding" },
+    { "Shift+Enter / Up",    "previous match" },
     { "%s+G",         "scroll to the top" },
     { "%s+Shift+G",   "scroll to the bottom" },
     { "%s+plus / minus / 0", "zoom in, out, reset" },
@@ -4253,6 +4649,15 @@ window_new (WebKitWebView *view, gboolean primary)
     gtk_label_set_max_width_chars (GTK_LABEL (w->urltoast), 70);
     gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->urltoast);
 
+    /* a hairline across the very top, so a slow page still says something */
+    w->loadbar = gtk_progress_bar_new ();
+    gtk_widget_add_css_class (w->loadbar, "br-load");
+    gtk_widget_set_halign (w->loadbar, GTK_ALIGN_FILL);
+    gtk_widget_set_valign (w->loadbar, GTK_ALIGN_START);
+    gtk_widget_set_can_target (w->loadbar, FALSE);
+    gtk_widget_set_visible (w->loadbar, FALSE);
+    gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->loadbar);
+
     /* Top right column: URL toast on top, downloads below. The whole
      * column is click-through, so it never swallows a click on the page. */
     w->topright = gtk_box_new (GTK_ORIENTATION_VERTICAL, (int) g_theme.gap);
@@ -4374,6 +4779,9 @@ view_wire (WebKitWebView *view)
     g_signal_connect (view, "create",             G_CALLBACK (on_create), NULL);
     g_signal_connect (view, "load-changed",       G_CALLBACK (on_load_core), NULL);
     g_signal_connect (view, "load-failed",        G_CALLBACK (on_load_failed_core), NULL);
+    g_signal_connect (view, "notify::title",     G_CALLBACK (on_title_toast), NULL);
+    g_signal_connect (view, "notify::estimated-load-progress",
+                      G_CALLBACK (on_load_progress), NULL);
 
     WebKitFindController *fc = webkit_web_view_get_find_controller (view);
     g_signal_connect (fc, "counted-matches",     G_CALLBACK (on_found_count), NULL);
@@ -4497,6 +4905,75 @@ setup_settings (void)
 
     if (g_app->settings_ready)
         g_app->settings_ready (g_settings);
+}
+
+/* ------------------------------------------------------------ start page */
+
+/*
+ * With no address to open, the window would otherwise come up empty. This
+ * is drawn from the same palette as everything else, so the browser looks
+ * like one thing from the first frame. It is served from load_html with no
+ * base URI, which makes it about:blank as far as the rest of the code is
+ * concerned - so it stays out of the history by itself.
+ */
+static char *
+start_page_html (void)
+{
+    Theme *t = &g_theme;
+
+    char *c_bg      = css_rgba (t->bg);
+    char *c_tile    = css_rgba (t->tile);
+    char *c_text    = css_rgba (t->text);
+    char *c_dim     = css_rgba (t->dim);
+    char *c_subtext = css_rgba (t->subtext);
+    char *c_hl      = css_rgba (t->hl);
+    char *c_glow    = css_rgba_at (t->hl, 0.22);
+
+    /* "browser-mini" reads better as browser + mini */
+    const char *name = g_app->default_app_id;
+    const char *dash = strchr (name, '-');
+    char       *head = dash ? g_strndup (name, (gsize) (dash - name)) : g_strdup (name);
+    const char *tail = dash ? dash + 1 : NULL;
+
+    char *html = g_strdup_printf (
+"<!doctype html><meta charset=\"utf-8\"><title>%s</title><style>"
+"html,body{height:100%%;margin:0}"
+"body{display:flex;align-items:center;justify-content:center;"
+"background:radial-gradient(circle at 50%% 38%%,%s 0%%,%s 72%%);"
+"font-family:%s,sans-serif;color:%s;"
+"-webkit-font-smoothing:antialiased}"
+".c{text-align:center;transform:translateY(-5vh)}"
+"h1{margin:0;font-size:11vmin;font-weight:200;letter-spacing:.18em;"
+"color:%s;text-shadow:0 0 60px %s}"
+"h1 b{color:%s;font-weight:600}"
+".r{width:9em;height:2px;margin:1.1em auto 1.4em;"
+"background:linear-gradient(90deg,transparent,%s,transparent)}"
+".v{font-family:%s,monospace;font-size:.85rem;color:%s;letter-spacing:.1em}"
+".k{margin-top:2.6em;font-family:%s,monospace;font-size:.95rem;color:%s}"
+".k b{color:%s;font-weight:600}"
+"</style>"
+"<div class=c><h1>%s%s<b>%s</b></h1><div class=r></div>"
+"<div class=v>%s &middot; build %s</div>"
+"<div class=k><b>%s+O</b> address &nbsp;&nbsp; <b>%s+H</b> history"
+" &nbsp;&nbsp; <b>F1</b> keys</div></div>",
+        name,
+        c_tile, c_bg,
+        *t->font ? t->font : "system-ui", c_text,
+        c_text, c_glow,
+        c_hl,
+        c_hl,
+        t->font_mono, c_dim,
+        t->font_mono, c_subtext,
+        c_hl,
+        head, tail ? " " : "", tail ? tail : "",
+        BROWSER_VERSION, BROWSER_BUILD,
+        g_mod_name, g_mod_name);
+
+    g_free (head);
+    g_free (c_bg);   g_free (c_tile); g_free (c_text);
+    g_free (c_dim);  g_free (c_subtext);
+    g_free (c_hl);   g_free (c_glow);
+    return html;
 }
 
 /* ----------------------------------------------------------------- main */
@@ -4697,12 +5174,12 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     GMainLoop *loop = g_main_loop_new (NULL, FALSE);
     g_object_set_data (G_OBJECT (win), "loop", loop);
 
-    /* No address given: come up blank with the history open, so there is
-     * something to pick from rather than an empty window. */
+    /* No address given: the start page, rather than an empty window. */
     if (!url_arg) {
-        webkit_web_view_load_uri (view, "about:blank");
+        char *html = start_page_html ();
+        webkit_web_view_load_html (view, html, NULL);
+        g_free (html);
         gtk_window_present (GTK_WINDOW (win));
-        omni_show (win_of (view), OMNI_HISTORY);
     } else {
         /* the front-end may claim the address, e.g. bigbrowser's "diag" */
         if (!(app->load_uri && app->load_uri (view, url_arg))) {

@@ -1,4 +1,4 @@
-# minibrowser / bigbrowser
+# browser-mini / browser-big
 
 Two WebKitGTK 6.0 (GTK4) page viewers sharing one core.
 
@@ -11,15 +11,15 @@ GTK 4.14 / WebKitGTK 2.52.3, and run headless under Xvfb.
 | --- | --- |
 | `browser_core.h` | Window state, the `BrowserApp` hook struct, shared helpers |
 | `browser_core.c` | Window, popup, toast, zoom, downloads, profiles, keys, history |
-| `minibrowser.c` | 20 lines. Fills in four fields and calls `browser_main()` |
-| `bigbrowser.c` | Camera / GStreamer / watchdogs / diagnostics on top of the core |
+| `browser-mini.c` | 20 lines. Fills in four fields and calls `browser_main()` |
+| `browser-big.c` | Camera / GStreamer / watchdogs / diagnostics on top of the core |
 
-minibrowser adds nothing to the core. Every hook is optional.
+browser-mini adds nothing to the core. Every hook is optional.
 
 ## Version
 
 ```
-minibrowser --version     # minibrowser 1.1.2 (build 060a193)
+browser-mini --version     # browser-mini 2.3.0 (build bcff1fa)
 make version
 ```
 
@@ -36,18 +36,21 @@ apt install build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev \
 make
 ```
 
-`libgstreamer1.0-dev` is only needed for bigbrowser. `make install` puts both
+`libgstreamer1.0-dev` is only needed for browser-big. `make install` puts both
 in `/usr/local/bin`.
 
 ## Usage
 
 ```
-minibrowser [URL] [options]
-bigbrowser  [URL|PATH|diag] [options]
+browser-mini [URL] [options]
+browser-big  [URL|PATH|diag] [options]
 ```
 
-With no address the window comes up on `about:blank` with the history popup
-open, so there is something to pick from rather than an empty window. A local
+With no address the window comes up on a start page: the program's name set
+large, a rule under it, the version and build id, and the three keys worth
+knowing. It is drawn from the same palette as the panels, so the browser
+looks like one thing from the first frame, and it is served without a base
+URI so it stays out of the history by itself. A local
 file needs three slashes — `file:///tmp/index.html` — though a bare path
 works too (`./index.html`, `/tmp/index.html`), and anything without a
 scheme is tried as https.
@@ -62,7 +65,7 @@ Run either with `-h` for the full option and key list.
 | `Ctrl+J` | Back |
 | `Ctrl+Shift+J` | Forward |
 | `Ctrl+H` | The same popup, opened on the history |
-| `Ctrl+F` | Find in page. `Enter` next, `Shift+Enter` previous, `Esc` out |
+| `Ctrl+F` | Find in page. `Enter`/`Down`/`Ctrl+N` next, `Shift+Enter`/`Up`/`Ctrl+Shift+N` previous, `Esc` out |
 | `Ctrl+S` | Download directory: this page, this site, or everything |
 | `Ctrl+K` | Add a search keyword |
 | `F1`, `Ctrl+/` | The key list, on screen |
@@ -78,7 +81,7 @@ Run either with `-h` for the full option and key list.
 Use `--mod alt|super|meta` to move the modifier off Ctrl. Nothing else is
 intercepted, so copy/paste keeps working inside the page.
 
-bigbrowser adds `Ctrl+Shift+M` (diagnostics page), `Ctrl+Shift+C` (warm the
+browser-big adds `Ctrl+Shift+M` (diagnostics page), `Ctrl+Shift+C` (warm the
 camera), `Ctrl+Shift+X` (release it), `Ctrl+Shift+V` (dump video state).
 
 ## History
@@ -99,8 +102,10 @@ Trimmed to the last 2000 lines at startup.
 One popup does both jobs, because they are the same job: an input line with
 the matching history under it.
 
-- `Ctrl+O` types an address. The list stays out of the way until `Tab` or
-  `Down` asks for it — with nothing typed yet, that is the whole history.
+- `Ctrl+O` types an address. The history is listed straight away — eight
+  lines by default, `list_rows` in a config file — and narrows as you type,
+  so the two are one thing: pick a line, or press `Enter` and what you typed
+  is loaded.
 - `Ctrl+H` opens the same popup on the history.
 
 Every panel — address, history, find, download directory, key list — is the
@@ -127,6 +132,15 @@ brightens on hover. When the directory popup asks about a clash the same two
 buttons become `Drop that rule` and `Keep both`, so both answers are on
 screen rather than implied.
 
+While a page loads, its address appears top left and becomes the page title
+as soon as one arrives, with a thin accent line across the very top showing
+progress.
+
+`Ctrl+A` selects all — in a popup's input, and in the page. WebKitGTK maps
+that key to move-to-start-of-line, an Emacs habit that surprises anyone
+typing into a web text field, so it is turned into WebKit's own select-all
+command. `select_all = no` gives the key back to the page.
+
 `Esc` closes whatever is on screen — popup, key list, download list or a
 message — and reaches the page only when nothing of ours is up.
 
@@ -150,7 +164,9 @@ read the same rules, since which directory a site's files go in has nothing
 to do with which cookie jar is in use. Rules written by an older build are
 carried over from the profile on first run.
 
-The key is a whole address or a bare host. The scopes are independent and the
+The key is a whole address or a bare host. The `Ctrl+S` popup lists everything
+stored, so a directory can be picked with the arrows or the mouse instead
+of typed, and the rule under the cursor dropped with `Delete` or `Ctrl+X`. The scopes are independent and the
 narrower one always wins: a rule on `a.de/b` keeps its own directory when
 `a.de` gets one. Setting a rule only ever writes the key for the scope you
 picked. A rule set on a page also covers
@@ -194,6 +210,11 @@ a file is going before it lands.
 
 ## Search keywords
 
+`Ctrl+K` opens a popup listing the keywords it knows. Add one by typing
+`g https://google.com/search?q={}`, pick an existing one with the arrows or
+the mouse to edit it, drop it with `Delete` or `Ctrl+X`.
+
+
 A single word in front of the text in the address popup runs a search:
 
 ```
@@ -229,7 +250,8 @@ Every overlay — the popup, toast, downloads — is drawn from
 swov's palette and geometry, so the two programs read as one set. Defaults
 match swov value for value: `tile` panels at `radius 14` with a `border 3`
 outline, `text` on top, `hint` for headers, `hl` (the orange) for the caret,
-the download bar and, at a third of its weight, for selections, `urgent` for failures.
+the download bar and, at a third of its weight, for selections, and `find_hl`
+(a pale blue) for the match `Ctrl+F` is sitting on, `urgent` for failures.
 
 Nothing is hardcoded. `ui_css_install()` builds the stylesheet from the
 theme, so changing `hl` in a config file moves every accent at once.
@@ -253,7 +275,7 @@ Files are read in this order, later wins, command line on top of both:
 
 ```
 ${XDG_CONFIG_HOME:-~/.config}/swov/config          shared palette
-${XDG_CONFIG_HOME:-~/.config}/minibrowser/config   our own settings
+${XDG_CONFIG_HOME:-~/.config}/browser-mini/config   our own settings
 ```
 
 So the palette lives once in swov's file and drives all three programs.
@@ -269,7 +291,7 @@ what makes one file safe to share.
 Every key is also a command line option:
 
 ```
-minibrowser https://example.com --hl=ff8800 -s radius=6 ui_scale=1.2
+browser-mini https://example.com --hl=ff8800 -s radius=6 ui_scale=1.2
 ```
 
 **Look keys** (shared with swov): `bg tile tile_sel tile_hover card
