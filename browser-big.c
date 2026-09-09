@@ -60,8 +60,7 @@ static guint    g_warm_timeout_id;
 static gboolean g_first_load_done;
 
 /* rendering / debugging switches that only touch the environment */
-static gboolean    g_no_gpu, g_no_webrtc, g_no_mediastream;
-static gboolean    g_no_hw_decode, g_no_dmabuf, g_no_compositing;
+static gboolean    g_no_webrtc, g_no_mediastream;
 static const char *g_gst_debug, *g_gst_dbgfile, *g_webkit_dbg;
 static int         g_gst_level = -1;
 
@@ -1009,10 +1008,7 @@ big_usage_options (GString *s)
 "  --load-timeout SEC  reload if a page does not commit in SEC (0 = off,\n"
 "                      default: %d)\n"
 "  --max-reloads N     auto-reloads per URL (default: %d)\n"
-"  --no-gpu            hardware acceleration policy NEVER\n"
-"  --no-hw-decode      WEBKIT_GST_ENABLE_HW_DECODERS=0\n"
-"  --no-dmabuf         WEBKIT_DISABLE_DMABUF_RENDERER=1\n"
-"  --no-compositing    WEBKIT_DISABLE_COMPOSITING_MODE=1\n"
+
 "  --no-webrtc         disable WebRTC only\n"
 "  --no-mediastream    disable MediaStream / getUserMedia only\n"
 "\n"
@@ -1084,10 +1080,6 @@ big_parse_arg (int argc, char **argv, int *i)
     /* ---- video / rendering ---- */
     if (!strcmp (a, "--no-media-watchdog"))   { g_media_watchdog = FALSE; return TRUE; }
     if (!strcmp (a, "--no-auto-reload"))      { g_auto_reload = FALSE; return TRUE; }
-    if (!strcmp (a, "--no-gpu"))              { g_no_gpu = TRUE; return TRUE; }
-    if (!strcmp (a, "--no-hw-decode"))        { g_no_hw_decode = TRUE; return TRUE; }
-    if (!strcmp (a, "--no-dmabuf"))           { g_no_dmabuf = TRUE; return TRUE; }
-    if (!strcmp (a, "--no-compositing"))      { g_no_compositing = TRUE; return TRUE; }
     if (!strcmp (a, "--no-webrtc"))           { g_no_webrtc = TRUE; return TRUE; }
     if (!strcmp (a, "--no-mediastream"))      { g_no_mediastream = TRUE; return TRUE; }
 
@@ -1165,9 +1157,6 @@ big_pre_gtk (void)
     }
     if (g_gst_dbgfile)    g_setenv ("GST_DEBUG_FILE", g_gst_dbgfile, TRUE);
     if (g_webkit_dbg)     g_setenv ("WEBKIT_DEBUG", g_webkit_dbg, TRUE);
-    if (g_no_hw_decode)   g_setenv ("WEBKIT_GST_ENABLE_HW_DECODERS", "0", TRUE);
-    if (g_no_dmabuf)      g_setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
-    if (g_no_compositing) g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
 }
 
 static void
@@ -1197,11 +1186,6 @@ big_settings_ready (WebKitSettings *s)
     if (g_no_webrtc) {
         webkit_settings_set_enable_webrtc (s, FALSE);
         LOG ("media: WebRTC disabled\n");
-    }
-    if (g_no_gpu) {
-        webkit_settings_set_hardware_acceleration_policy (
-            s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
-        LOG ("gpu: hardware acceleration policy = NEVER\n");
     }
 }
 

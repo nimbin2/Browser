@@ -19,7 +19,7 @@ browser-mini adds nothing to the core. Every hook is optional.
 ## Version
 
 ```
-browser-mini --version     # browser-mini 2.3.0 (build bcff1fa)
+browser-mini --version     # browser-mini 2.3.3 (build 72335fd)
 make version
 ```
 
@@ -231,6 +231,32 @@ search_s = https://google.com/search?hl=en&q={}
 
 A bare `s` with nothing after it is still treated as an address, so a site
 whose name collides with a keyword still works.
+
+## When a page renders blank or zero sized
+
+Two causes were found in the loading bar and fixed in 2.3.3. It reported a
+negative minimum width, which makes GTK abandon the allocation pass and
+leaves the web view unallocated — a zero-sized viewport and a white window
+you can scroll forever. It also changed size on every progress tick, which
+re-allocated the overlay and so re-laid-out the page dozens of times a
+second: black and white flicker in time with the page's own activity. The
+bar is drawn with cairo now, at a constant size, so a change repaints and
+nothing more. `--no-load-bar` turns it off.
+
+Otherwise it is usually
+
+Usually a broken GL or compositing stack rather than the page. In devtools
+a `body` of `0px x 0px` means the viewport itself has no size, so nothing
+the page's CSS says can help. Try these in order, both browsers:
+
+```
+browser-mini URL --no-dmabuf
+browser-mini URL --no-compositing
+browser-mini URL --no-gpu
+```
+
+`--no-hw-decode` is the same idea for video. Any of them can go in a config
+file once you know which one it was.
 
 ## Options worth knowing
 

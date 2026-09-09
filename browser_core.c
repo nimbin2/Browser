@@ -76,6 +76,8 @@ static gboolean    g_follow_page_title = TRUE; /* see --title / --page-title */
 static char       *g_clip_cmd;     /* --clip-cmd, NULL -> wl-copy  */
 static gboolean    g_no_middle_paste = TRUE;  /* --enable-middle-click-paste */
 static gboolean    g_fix_select_all = TRUE;   /* see on_key */
+static gboolean    g_load_bar       = TRUE;   /* the hairline while loading */
+static gboolean    g_no_gpu, g_no_dmabuf, g_no_compositing, g_no_hw_decode;
 static gboolean    g_want_page_title;
 static char       *g_css_owned;    /* when --css came from the config */
 
@@ -1126,6 +1128,7 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "quiet"))         { g_quiet = truthy (v); return TRUE; }
     if (key_is (k, "page_title"))    { g_want_page_title = truthy (v); return TRUE; }
     if (key_is (k, "select_all"))    { g_fix_select_all = truthy (v); return TRUE; }
+    if (key_is (k, "load_bar"))      { g_load_bar = truthy (v); return TRUE; }
     if (key_is (k, "middle_click_paste")) { g_no_middle_paste = !truthy (v); return TRUE; }
     if (key_is (k, "always_overwrite")) {
         g_always_overwrite     = truthy (v);
@@ -1306,6 +1309,13 @@ usage (const char *argv0, gboolean to_stdout)
 "  --css FILE          inject FILE as a user stylesheet\n"
 "  --devtools          open the inspector once the first page commits\n"
 "  --no-media          deny camera / microphone / screen-share requests\n"
+"  --no-load-bar       do not draw the loading line at the top\n"
+"  --no-gpu            hardware acceleration policy NEVER\n"
+"  --no-dmabuf         WEBKIT_DISABLE_DMABUF_RENDERER=1\n"
+"  --no-compositing    WEBKIT_DISABLE_COMPOSITING_MODE=1\n"
+"  --no-hw-decode      WEBKIT_GST_ENABLE_HW_DECODERS=0\n"
+"                      the four to reach for when a machine comes back up\n"
+"                      and pages render blank or zero sized\n"
 "  --enable-middle-click-paste\n"
 "                      let middle-button clicks reach the page. They are\n"
 "                      swallowed by default, so a stray click cannot paste\n"
@@ -1371,7 +1381,8 @@ usage (const char *argv0, gboolean to_stdout)
 "           radius border pad gap win_gap ui_scale\n"
 "           font font_mono label_px title_px hint_px\n"
 "  ours:    title app_id zoom mod clip_cmd download_dir profile private\n"
-"           no_media page_title middle_click_paste select_all css\n"
+"           no_media page_title middle_click_paste select_all load_bar\n"
+"           css\n"
 "           user_agent quiet\n"
 "           always_overwrite\n"
 "           search_KEY (e.g. search_s = https://google.com/search?q={})\n"
@@ -1734,16 +1745,7 @@ ui_css_install (void)
 
     /* ---- the loading hairline, across the very top ---- */
     g_string_append_printf (css,
-        "progressbar.br-load, progressbar.br-load > trough {"
-        "  background-color: transparent; background-image: none;"
-        "  border: none; border-radius: 0; min-height: %.0fpx;"
-        "  padding: 0; margin: 0;"
-        "}"
-        "progressbar.br-load > trough > progress {"
-        "  background-color: %s; border: none; border-radius: 0;"
-        "  min-height: %.0fpx;"
-        "}",
-        3.0 * s, c_hl, 3.0 * s);
+        "/* the loading hairline is drawn, not styled */");
 
     /* ---- picker rows ---- */
     g_string_append_printf (css,
@@ -2560,8 +2562,17 @@ on_load_progress (GObject *obj, GParamSpec *ps, gpointer u)
 
     double p = webkit_web_view_get_estimated_load_progress (view);
 
-    gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (w->loadbar), p);
-    gtk_widget_set_visible (w->loadbar, p > 0.0 && p < 1.0);
+    /*
+     * Only the fill inside the bar changes. Nothing here may alter the
+     * bar's own size: the previous version resized it on every tick,
+     * which re-allocated the whole overlay - and re-allocating a
+     * WebKitWebView makes the web process re-lay-out and recomposite.
+     * At the rate estimated-load-progress fires, that is the black and
+     * white flicker while a page loads.
+     */
+    w->load_frac = CLAMP (p, 0.0, 1.0);
+    gtk_widget_set_visible (w->loadbar, g_load_bar && p > 0.0 && p < 1.0);
+    gtk_widget_queue_draw (w->loadbar);          /* repaint, not re-layout */
 }
 
 static void
@@ -4453,6 +4464,27 @@ on_middle_press (GtkGestureClick *g, int n, double x, double y, gpointer u)
  * or shorter than they would like: everything is clamped to what the
  * window actually has, and the popup is centered in whatever is left.
  */
+/*
+ * Drawn by hand. A GtkProgressBar kept reporting a negative minimum width
+ * for its inner node once its padding and height were overridden, and
+ * anything that changes size on every progress tick re-allocates the
+ * overlay - which re-lays-out the page. This changes pixels only.
+ */
+static void
+draw_loadbar (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer u)
+{
+    (void) area;
+    Win   *w = u;
+    Color  c = g_theme.hl;
+
+    if (w->load_frac <= 0.0)
+        return;
+
+    cairo_set_source_rgba (cr, c.r, c.g, c.b, c.a);
+    cairo_rectangle (cr, 0, 0, width * CLAMP (w->load_frac, 0.0, 1.0), height);
+    cairo_fill (cr);
+}
+
 static gboolean
 on_overlay_position (GtkOverlay *ov, GtkWidget *child, GdkRectangle *alloc, gpointer u)
 {
@@ -4468,6 +4500,22 @@ on_overlay_position (GtkOverlay *ov, GtkWidget *child, GdkRectangle *alloc, gpoi
     /* One width for every panel, whatever it holds: the address popup,
      * the history, the directory popup and the key list are all the same
      * object as far as the eye is concerned. */
+    /*
+     * The bar is a plain box laid out here rather than a GtkProgressBar:
+     * a progress bar with its padding and min-height overridden computed a
+     * negative min width for its inner node, and GTK abandons an
+     * allocation pass that sees one - which left the page itself
+     * unallocated, a zero-sized viewport and a white window.
+     */
+    if (child == w->loadbar) {
+        alloc->x      = 0;
+        alloc->y      = 0;
+        alloc->width  = W;              /* constant, so the page is never
+                                         * re-allocated as the bar fills */
+        alloc->height = MAX (1, (int) (3 * g_theme.ui_scale));
+        return TRUE;
+    }
+
     if (child == w->omni || child == w->keys)
         want = (int) (g_theme.popup_w * g_theme.ui_scale);
     else if (child == w->topright)
@@ -4650,7 +4698,8 @@ window_new (WebKitWebView *view, gboolean primary)
     gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->urltoast);
 
     /* a hairline across the very top, so a slow page still says something */
-    w->loadbar = gtk_progress_bar_new ();
+    w->loadbar = gtk_drawing_area_new ();
+    gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (w->loadbar), draw_loadbar, w, NULL);
     gtk_widget_add_css_class (w->loadbar, "br-load");
     gtk_widget_set_halign (w->loadbar, GTK_ALIGN_FILL);
     gtk_widget_set_valign (w->loadbar, GTK_ALIGN_START);
@@ -4903,6 +4952,12 @@ setup_settings (void)
     webkit_settings_set_javascript_can_access_clipboard         (g_settings, TRUE);
     webkit_settings_set_enable_write_console_messages_to_stdout (g_settings, !g_quiet);
 
+    if (g_no_gpu) {
+        webkit_settings_set_hardware_acceleration_policy (
+            g_settings, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        LOG ("gpu: hardware acceleration policy = NEVER\n");
+    }
+
     if (g_app->settings_ready)
         g_app->settings_ready (g_settings);
 }
@@ -4937,8 +4992,9 @@ start_page_html (void)
 
     char *html = g_strdup_printf (
 "<!doctype html><meta charset=\"utf-8\"><title>%s</title><style>"
-"html,body{height:100%%;margin:0}"
-"body{display:flex;align-items:center;justify-content:center;"
+"html,body{margin:0}"
+"body{min-height:100vh;box-sizing:border-box;padding:8vh 2rem;"
+"display:flex;align-items:center;justify-content:center;"
 "background:radial-gradient(circle at 50%% 38%%,%s 0%%,%s 72%%);"
 "font-family:%s,sans-serif;color:%s;"
 "-webkit-font-smoothing:antialiased}"
@@ -5060,6 +5116,16 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             open_devtools = TRUE;
         } else if (!strcmp (a, "--no-media")) {
             g_deny_media = TRUE;
+        } else if (!strcmp (a, "--no-load-bar")) {
+            g_load_bar = FALSE;
+        } else if (!strcmp (a, "--no-gpu")) {
+            g_no_gpu = TRUE;
+        } else if (!strcmp (a, "--no-dmabuf")) {
+            g_no_dmabuf = TRUE;
+        } else if (!strcmp (a, "--no-compositing")) {
+            g_no_compositing = TRUE;
+        } else if (!strcmp (a, "--no-hw-decode")) {
+            g_no_hw_decode = TRUE;
         } else if (!strcmp (a, "--enable-middle-click-paste")) {
             g_no_middle_paste = FALSE;
         } else if (!strcmp (a, "--download-dir")) {
@@ -5131,6 +5197,12 @@ browser_main (int argc, char **argv, const BrowserApp *app)
 
     if (g_private && (g_profile || g_clear_data))
         LOG ("note: --private ignores --profile/--clear-data\n");
+
+    /* Must be set before any process is spawned, so the web and GPU
+     * processes inherit them. */
+    if (g_no_dmabuf)      g_setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
+    if (g_no_compositing) g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
+    if (g_no_hw_decode)   g_setenv ("WEBKIT_GST_ENABLE_HW_DECODERS", "0", TRUE);
 
     if (app->pre_gtk)
         app->pre_gtk ();

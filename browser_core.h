@@ -46,6 +46,7 @@ typedef struct {
     GtkWidget     *omnicancel;
     GtkWidget     *urltoast;    /* the address, top left, on a new page     */
     GtkWidget     *loadbar;     /* a thin line across the top while loading */
+    double         load_frac;
     guint          urltoast_id;
     GtkWidget     *keys;        /* key reference, hidden by default         */
     GtkWidget     *topright;    /* box holding the toast and the downloads */
