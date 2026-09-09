@@ -19,12 +19,15 @@ browser-mini adds nothing to the core. Every hook is optional.
 ## Version
 
 ```
-browser-mini --version     # browser-mini 2.3.3 (build 72335fd)
+browser-mini --version     # browser-mini 2.3.4 (build 848f743)
 make version
 ```
 
 The build id is an md5 of the sources, so two builds can be told apart
 without guessing.
+
+`-h` and `-V` are answered before anything else on the command line is
+looked at, so they work even next to a mistyped option.
 
 ## Build
 

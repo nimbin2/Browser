@@ -5045,6 +5045,23 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     g_app = app;
     theme_defaults ();
 
+    /*
+     * Help and version are answered before anything else is looked at, so
+     * they cannot be lost behind a mistyped option earlier on the line, a
+     * config file, or a front-end that exits while parsing its own flags.
+     */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp (argv[i], "-h") || !strcmp (argv[i], "--help")) {
+            usage (argv[0], TRUE);
+            return 0;
+        }
+        if (!strcmp (argv[i], "-V") || !strcmp (argv[i], "--version")) {
+            g_print ("%s %s (build %s)\n", app->default_app_id,
+                     BROWSER_VERSION, BROWSER_BUILD);
+            return 0;
+        }
+    }
+
     /* config first, so anything on the command line still wins */
     for (int i = 1; i < argc; i++) {
         if ((!strcmp (argv[i], "-c") || !strcmp (argv[i], "--config")) && i + 1 < argc)
@@ -5167,8 +5184,13 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             cfg_set_line (a);                 /* pad=12 */
         } else if (a[0] != '-' && !url_arg) {
             url_arg = a;
+        } else if (a[0] != '-') {
+            g_printerr ("%s: a second address: %s\n", argv[0], a);
+            g_printerr ("%s: already opening: %s\n", argv[0], url_arg);
+            usage_short (argv[0]);
+            return 1;
         } else {
-            g_printerr ("%s: unknown argument: %s\n", argv[0], a);
+            g_printerr ("%s: unknown option: %s\n", argv[0], a);
             usage_short (argv[0]);
             return 1;
         }
