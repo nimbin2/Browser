@@ -1,8 +1,8 @@
 /*
- * browser_core - the shared half of minibrowser and bigbrowser.
+ * browser_core - the shared half of browser-mini and browser-big.
  *
  * See browser_core.h for the front-end interface. Nothing in here knows
- * anything about cameras, GStreamer or diagnostics; that is bigbrowser's
+ * anything about cameras, GStreamer or diagnostics; that is browser-big's
  * business and it hangs off the BrowserApp hooks.
  */
 
@@ -11,9 +11,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <grp.h>
+#include <glib/gstdio.h>
+#include <execinfo.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <glib-unix.h>
 
 #ifdef GDK_WINDOWING_WAYLAND
 #include <gdk/wayland/gdkwayland.h>
@@ -39,6 +44,7 @@
 #define HIST_FILE     "history.tsv"
 #define DLRULES_FILE  "download-dirs.tsv"
 #define SEARCH_FILE   "searches.tsv"
+#define STARTBG_FILE  "start-bg"
 #define HIST_KEEP  2000           /* lines kept when the file is trimmed */
 #define PICK_ROWS  200            /* most matches the picker will build   */
 #define HIST_SETTLE_MS 400        /* wait for the page <title> to arrive */
@@ -50,6 +56,11 @@ WebKitNetworkSession *g_session;
 
 gboolean    g_quiet;
 gboolean    g_deny_media;
+/* ask (the default, as a browser does), allow, or deny - every site */
+typedef enum { MEDIA_ASK, MEDIA_ALLOW, MEDIA_DENY } MediaPolicy;
+static MediaPolicy g_media_policy = MEDIA_ASK;
+#define PERM_FILE "permissions.tsv"
+static GHashTable *g_perms;        /* "host" -> "allow" | "deny" */
 gboolean    g_private;
 double      g_zoom = 1.0;
 char       *g_title;               /* window title, see --title    */
@@ -68,6 +79,31 @@ static gboolean    g_find_css_on;   /* the find highlight sheet is in */
 static int         g_windows;
 
 static char       *g_download_dir;
+
+/*
+ * Media mode (F2): a <mod>+click on a video goes to `player` (mpv) and on
+ * an image to `image_viewer` (imv) instead of being followed. The address,
+ * or for an image the downloaded file, is appended as the last argument;
+ * no shell is involved. --player on the command line starts in the mode.
+ */
+static char       *g_player;
+static char       *g_image_viewer;
+static gboolean    g_media_mode;
+static char      **g_player_match;   /* NULL: the YouTube set below */
+
+static const char *const PLAYER_MATCH_DEFAULT[] = {
+    "youtube.com/watch", "youtube.com/shorts/", "youtube.com/live/",
+    "youtube.com/embed/", "youtube-nocookie.com/embed/", "youtu.be/", NULL
+};
+
+/* direct files, by the end of the path */
+static const char *const VIDEO_EXT[] = {
+    ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".ogv", ".m3u8", ".mpd", NULL
+};
+static const char *const IMAGE_EXT[] = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".jxl", ".bmp",
+    ".tif", ".tiff", ".svg", ".heic", NULL
+};
 static char       *g_data_dir;     /* profile data dir, NULL when private */
 static char       *g_profile;      /* NULL -> "default" */
 static gboolean    g_clear_data;
@@ -78,6 +114,34 @@ static gboolean    g_no_middle_paste = TRUE;  /* --enable-middle-click-paste */
 static gboolean    g_fix_select_all = TRUE;   /* see on_key */
 static gboolean    g_load_bar       = TRUE;   /* the hairline while loading */
 static gboolean    g_no_gpu, g_no_dmabuf, g_no_compositing, g_no_hw_decode;
+static gboolean    g_no_jit;
+static gboolean    g_no_devtools;    /* --no-devtools: no inspector machinery at all */
+static gboolean    g_all_messages;    /* --all-messages: no deduplication */
+static gboolean    g_no_console;      /* --no-console: drop the page's logging */
+static const char *g_gsk_renderer = "gl";   /* GTK4's renderer; "auto" = GTK's own choice */
+static GPtrArray  *g_features;       /* --feature NAME[=on|off] */
+static gboolean    g_gl_info;        /* --gl-info: check the graphics stack, exit */
+static GPtrArray  *g_jsc_opts;       /* --jsc NAME=VALUE */
+static gboolean    g_shared_ab = TRUE;  /* off with shared_array_buffer = no */
+static gboolean    g_forget_perms;   /* --forget-permissions */
+static gboolean truthy (const char *v);
+static const char *g_list_features;  /* --list-features [filter] */
+
+/*
+ * WebKit and GLib write straight to stderr from several processes, and
+ * some lines repeat dozens of times a run - the desktop portal being
+ * unreachable is printed on every attempt. We cannot stop WebKit asking,
+ * so stderr is threaded through a pipe and each distinct line is shown
+ * twice, then counted. Nothing is hidden: the totals are printed at exit.
+ */
+#define NOISE_SHOW   2       /* occurrences printed before counting starts */
+#define NOISE_MAX  500       /* distinct lines remembered */
+
+static GMainLoop  *g_loop;           /* so a signal can end the run tidily */
+static int         g_real_stderr = -1;
+static int         g_noise_fd    = -1;   /* read end, for the final drain */
+static GHashTable *g_noise;          /* line -> occurrences */
+static gboolean    g_no_sandbox;
 static gboolean    g_want_page_title;
 static char       *g_css_owned;    /* when --css came from the config */
 
@@ -195,20 +259,31 @@ elide (const char *s, int max_chars)
 
 /* ------------------------------------------------------------- helpers */
 
+/*
+ * GST_PLUGIN_FEATURE_RANK is one variable that several options feed, and
+ * the user may have set it too. Append, never replace: GStreamer applies
+ * the entries in order, so a later one for the same element wins.
+ */
 void
-settings_set_bool_if_exists (WebKitSettings *s, const char *prop, gboolean value)
+gst_rank_env_add (const char *spec)
 {
-    if (g_object_class_find_property (G_OBJECT_GET_CLASS (s), prop))
-        g_object_set (G_OBJECT (s), prop, value, NULL);
-    else
-        LOG ("note: WebKitSettings property not supported: %s\n", prop);
+    const char *had = g_getenv ("GST_PLUGIN_FEATURE_RANK");
+    char       *v   = (had && *had) ? g_strconcat (had, ",", spec, NULL) : g_strdup (spec);
+
+    g_setenv ("GST_PLUGIN_FEATURE_RANK", v, TRUE);
+    g_free (v);
 }
 
+/* A front-end asking for a WebKit runtime feature, same as --feature. */
 void
-object_set_string_if_exists (GObject *o, const char *prop, const char *value)
+feature_request (const char *spec)
 {
-    if (g_object_class_find_property (G_OBJECT_GET_CLASS (o), prop))
-        g_object_set (o, prop, value, NULL);
+    if (!g_features)
+        g_features = g_ptr_array_new_with_free_func (g_free);
+    for (guint i = 0; i < g_features->len; i++)
+        if (!g_strcmp0 (g_ptr_array_index (g_features, i), spec))
+            return;
+    g_ptr_array_add (g_features, g_strdup (spec));
 }
 
 /* "example.com" -> "https://example.com", "./page.html" -> "file:///...". */
@@ -744,7 +819,6 @@ dl_dir_set (const char *uri, const char *dir, DlScope scope)
 
     g_free (g_download_dir);
     g_download_dir = g_strdup (dir);
-    object_set_string_if_exists (G_OBJECT (g_session), "downloads-directory", g_download_dir);
 }
 
 /* ------------------------------------------------------- search keywords */
@@ -760,6 +834,21 @@ dl_dir_set (const char *uri, const char *dir, DlScope scope)
  */
 
 static GHashTable *g_searches;     /* keyword -> url template */
+static char       *g_search_default;  /* the keyword used with no prefix */
+
+/*
+ * Always there, whatever the profile: a keyword of the same name in
+ * searches.tsv or a config file (search_g = ...) replaces one of these,
+ * and search_default picks another default. The SDL wiki has no search
+ * address of its own, so s asks DuckDuckGo for it.
+ */
+static const char *const SEARCH_BUILTIN[][2] = {
+    { "g", "https://www.google.com/search?q={}" },
+    { "d", "https://duckduckgo.com/?q={}" },
+    { "w", "https://en.wikipedia.org/w/index.php?search={}" },
+    { "s", "https://duckduckgo.com/?q=site%3Awiki.libsdl.org+SDL3+{}" },
+};
+#define SEARCH_BUILTIN_DEFAULT "g"
 
 static void searches_setup (const char *data_dir);
 
@@ -799,8 +888,11 @@ searches_save (void)
         g_hash_table_insert (merged, g_strdup (k), g_strdup (v));   /* ours wins */
 
     g_hash_table_iter_init (&it, merged);
-    while (g_hash_table_iter_next (&it, &k, &v))
-        g_string_append_printf (s, "%s\t%s\n", (char *) k, (char *) v);
+    while (g_hash_table_iter_next (&it, &k, &v)) {
+        gboolean dflt = !g_strcmp0 ((char *) k, g_search_default);
+        g_string_append_printf (s, "%s\t%s%s\n", (char *) k, (char *) v,
+                                dflt ? "\tdefault" : "");
+    }
 
     g_file_set_contents (path, s->str, -1, NULL);
 
@@ -817,20 +909,22 @@ searches_setup (const char *data_dir)
     if (!g_searches)
         g_searches = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
-    if (!data_dir)
-        return;
-
-    char *path = g_build_filename (data_dir, SEARCH_FILE, NULL);
+    char *path = data_dir ? g_build_filename (data_dir, SEARCH_FILE, NULL) : NULL;
     char *data = NULL;
 
-    if (g_file_get_contents (path, &data, NULL, NULL)) {
+    if (path && g_file_get_contents (path, &data, NULL, NULL)) {
         char **lines = g_strsplit (data, "\n", -1);
         for (int i = 0; lines[i]; i++) {
             if (!*lines[i])
                 continue;
-            char **f = g_strsplit (lines[i], "\t", 2);
-            if (g_strv_length (f) == 2 && *f[0] && *f[1])
+            char **f = g_strsplit (lines[i], "\t", 3);
+            if (g_strv_length (f) >= 2 && *f[0] && *f[1]) {
                 g_hash_table_insert (g_searches, g_strdup (f[0]), g_strdup (f[1]));
+                if (g_strv_length (f) >= 3 && !g_strcmp0 (g_strstrip (f[2]), "default")) {
+                    g_free (g_search_default);
+                    g_search_default = g_strdup (f[0]);
+                }
+            }
             g_strfreev (f);
         }
         g_strfreev (lines);
@@ -838,18 +932,95 @@ searches_setup (const char *data_dir)
         LOG ("search: %u keywords from %s\n", g_hash_table_size (g_searches), path);
     }
 
+    /* the built-ins fill in whatever the file and the config left out */
+    for (gsize i = 0; i < G_N_ELEMENTS (SEARCH_BUILTIN); i++)
+        if (!g_hash_table_contains (g_searches, SEARCH_BUILTIN[i][0]))
+            g_hash_table_insert (g_searches, g_strdup (SEARCH_BUILTIN[i][0]),
+                                 g_strdup (SEARCH_BUILTIN[i][1]));
+    if (!g_search_default || !g_hash_table_contains (g_searches, g_search_default)) {
+        g_free (g_search_default);
+        g_search_default = g_strdup (SEARCH_BUILTIN_DEFAULT);
+    }
+    LOG ("search: %u keywords, default %s\n",
+         g_hash_table_size (g_searches), g_search_default);
+
     g_free (path);
 }
 
 static void
-search_set (const char *key, const char *url)
+search_set (const char *key, const char *url, gboolean make_default)
 {
     if (!g_searches)
         g_searches = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 
     g_hash_table_insert (g_searches, g_strdup (key), g_strdup (url));
+
+    if (make_default) {
+        g_free (g_search_default);
+        g_search_default = g_strdup (key);
+    } else if (!g_strcmp0 (key, g_search_default)) {
+        g_clear_pointer (&g_search_default, g_free);   /* unticked */
+    }
+
     searches_save ();
-    LOG ("search: %s -> %s\n", key, url);
+    LOG ("search: %s -> %s%s\n", key, url, make_default ? "  (default)" : "");
+}
+
+/*
+ * Whether a line is meant as an address or as something to search for.
+ * The rule everyone already knows from other browsers: a scheme, a path
+ * or a dotted host is an address; words with a space in them, or a single
+ * bare word, are a search.
+ */
+static gboolean
+looks_like_address (const char *s)
+{
+    if (!s || !*s)
+        return FALSE;
+
+    if (strstr (s, "://")           || g_str_has_prefix (s, "about:") ||
+        g_str_has_prefix (s, "data:")  || g_str_has_prefix (s, "file:") ||
+        g_str_has_prefix (s, "mailto:"))
+        return TRUE;
+
+    if (*s == '/' || *s == '.' || *s == '~')
+        return TRUE;                   /* a path */
+
+    if (strchr (s, ' ') || strchr (s, '\t'))
+        return FALSE;                  /* words */
+
+    if (!g_ascii_strcasecmp (s, "localhost") || g_str_has_prefix (s, "localhost:"))
+        return TRUE;
+
+    if (g_file_test (s, G_FILE_TEST_EXISTS))
+        return TRUE;
+
+    const char *dot = strrchr (s, '.');
+    return dot && dot != s && dot[1];  /* a dotted host */
+}
+
+/* Fill the default template with the whole line. */
+static char *
+search_default_uri (const char *line)
+{
+    const char *tmpl = g_search_default
+                     ? g_hash_table_lookup (g_searches, g_search_default) : NULL;
+    if (!tmpl || !line || !*line)
+        return NULL;
+
+    char *enc = g_uri_escape_string (line, NULL, TRUE);
+    char *out;
+
+    if (strstr (tmpl, "{}")) {
+        char **parts = g_strsplit (tmpl, "{}", -1);
+        out = g_strjoinv (enc, parts);
+        g_strfreev (parts);
+    } else {
+        out = g_strconcat (tmpl, enc, NULL);
+    }
+
+    g_free (enc);
+    return out;
 }
 
 /*
@@ -895,6 +1066,728 @@ search_expand (const char *line)
     return out;
 }
 
+/* Ctrl+C should end the run the same way closing the window does, so the
+ * repeated-message totals and anything else at shutdown still happen. */
+static gboolean
+on_quit_signal (gpointer u)
+{
+    (void) u;
+    if (g_loop)
+        g_main_loop_quit (g_loop);
+    return G_SOURCE_REMOVE;
+}
+
+/* ------------------------------------------------------------- gl info */
+
+/*
+ * Whether the machine's graphics are wired up the way this browser needs
+ * them, checked the way it will use them: can the render node be opened,
+ * is the user allowed to, does GTK get a GL context and of what kind,
+ * does GTK's own choice of renderer differ from ours. Read this before
+ * blaming any page.
+ */
+static void
+gl_info (void)
+{
+    g_print ("graphics check\n\n");
+
+    /* the device nodes, and whether this user can open them */
+    GDir *d = g_dir_open ("/dev/dri", 0, NULL);
+    const char *n;
+    gboolean render_ok = FALSE;
+    g_print ("%-24s %-10s %s\n", "device", "mode", "open for this user");
+    while (d && (n = g_dir_read_name (d))) {
+        char *p = g_build_filename ("/dev/dri", n, NULL);
+        GStatBuf st;
+        if (g_stat (p, &st) == 0 && S_ISCHR (st.st_mode)) {   /* nodes only */
+            int fd = open (p, O_RDWR | O_CLOEXEC);
+            gboolean ok = fd >= 0;
+            if (ok) close (fd);
+            if (ok && g_str_has_prefix (n, "renderD")) render_ok = TRUE;
+            g_print ("%-24s %04o       %s%s\n", p, st.st_mode & 07777,
+                     ok ? "yes" : "NO",
+                     ok ? "" : "   <- the web process cannot use the GPU without this");
+        }
+        g_free (p);
+    }
+    if (d) g_dir_close (d); else g_print ("/dev/dri does not exist: no DRM device at all\n");
+
+    /* groups: video and render are what the nodes are usually owned by */
+    gid_t groups[64]; int ng = getgroups (64, groups);
+    GString *gs = g_string_new ("");
+    for (int i = 0; i < ng; i++) {
+        struct group *gr = getgrgid (groups[i]);
+        if (gr && (!strcmp (gr->gr_name, "video") || !strcmp (gr->gr_name, "render")))
+            g_string_append_printf (gs, "%s ", gr->gr_name);
+    }
+    g_print ("\ngroups this user is in of video/render: %s\n",
+             gs->len ? gs->str : "NONE   <- add the user to both, then log in again");
+    g_string_free (gs, TRUE);
+    if (!render_ok)
+        g_print ("render node not openable: GL, Vulkan, dmabuf and VA-API in the web\n"
+                 "process all fall back or fail. This is usually the whole problem.\n");
+
+    /* what GTK gets when it asks for GL, which is what the window uses */
+    GdkDisplay *disp = gdk_display_get_default ();
+    GError *err = NULL;
+    g_print ("\nnote: an EACCES (-13) from amdgpu_query_info on the GBM platform is the\n"
+             "card node refusing acceleration to a client the compositor has not\n"
+             "authenticated - normal when the browser runs as a different user than the\n"
+             "session; Mesa falls back to the render node, WebKit's worker WebGL may not.\n");
+    g_print ("\nGTK display: %s\n", disp ? G_OBJECT_TYPE_NAME (disp) : "none");
+    if (disp && !gdk_display_prepare_gl (disp, &err)) {
+        g_print ("GTK GL: NOT AVAILABLE: %s\n", err ? err->message : "?");
+        g_clear_error (&err);
+    } else if (disp) {
+        GdkGLContext *ctx = gdk_display_create_gl_context (disp, &err);
+        if (!ctx) {
+            g_print ("GTK GL: context creation failed: %s\n", err ? err->message : "?");
+            g_clear_error (&err);
+        } else if (!gdk_gl_context_realize (ctx, &err)) {
+            g_print ("GTK GL: context could not be realized: %s\n", err ? err->message : "?");
+            g_clear_error (&err);
+        } else {
+            int maj = 0, min = 0;
+            gdk_gl_context_get_version (ctx, &maj, &min);
+            GdkGLAPI api = gdk_gl_context_get_api (ctx);
+            g_print ("GTK GL: %s %d.%d%s\n",
+                     api == GDK_GL_API_GLES ? "OpenGL ES" : "OpenGL", maj, min,
+                     gdk_gl_context_is_legacy (ctx) ? " (legacy profile)" : "");
+        }
+        if (ctx) g_object_unref (ctx);
+    }
+
+    g_print ("GTK renderer in use: %s (GSK_RENDERER=%s)\n",
+             g_gsk_renderer ? g_gsk_renderer : "GTK's choice",
+             g_getenv ("GSK_RENDERER") ? g_getenv ("GSK_RENDERER") : "unset");
+
+    g_print ("\nenvironment that steers this:\n");
+    const char *vars[] = { "WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+                           "LIBGL_ALWAYS_SOFTWARE", "MESA_LOADER_DRIVER_OVERRIDE",
+                           "GBM_BACKEND", "WEBKIT_DISABLE_DMABUF_RENDERER",
+                           "WEBKIT_DISABLE_COMPOSITING_MODE", "LIBVA_DRIVER_NAME", NULL };
+    for (int i = 0; vars[i]; i++)
+        g_print ("  %-34s %s\n", vars[i], g_getenv (vars[i]) ? g_getenv (vars[i]) : "(unset)");
+
+    g_print ("\nby hand, for the layers below GTK:\n"
+             "  dmesg | grep -i amdgpu | head        firmware loaded, no errors?\n"
+             "  glxinfo -B  /  eglinfo -B            renderer string: radeonsi, not llvmpipe\n"
+             "  vulkaninfo --summary                 radv device present?\n"
+             "  vainfo                               VA-API profiles?\n"
+             "  ls /lib/firmware/amdgpu | head       firmware files present for this chip?\n");
+}
+
+/* --------------------------------------------------------- webkit features */
+
+/*
+ * WebKit carries a few hundred runtime feature switches, some off by
+ * default and needed by real sites. AllowWebGLInWorkers is the one that
+ * matters most here: without it a library that renders in a worker gets
+ * "Cannot create a canvas in this context" and falls back to the CPU.
+ */
+static void
+features_list (const char *filter)
+{
+    WebKitFeatureList *all = webkit_settings_get_all_features ();
+    gsize              n   = webkit_feature_list_get_length (all);
+    guint              shown = 0;
+
+    g_print ("%-46s %-8s %s\n", "feature", "default", "category");
+
+    for (gsize i = 0; i < n; i++) {
+        WebKitFeature *f  = webkit_feature_list_get (all, i);
+        const char    *id = webkit_feature_get_identifier (f);
+
+        if (!id || (filter && *filter &&
+                    !strcasestr (id, filter)))
+            continue;
+
+        g_print ("%-46s %-8s %s\n", id,
+                 webkit_feature_get_default_value (f) ? "on" : "off",
+                 webkit_feature_get_category (f) ? webkit_feature_get_category (f) : "");
+        shown++;
+    }
+
+    g_print ("\n%u of %zu features shown\n", shown, n);
+    webkit_feature_list_unref (all);
+}
+
+static void
+features_apply (WebKitSettings *s)
+{
+    if (!g_features)
+        return;
+
+    WebKitFeatureList *all = webkit_settings_get_all_features ();
+    gsize              n   = webkit_feature_list_get_length (all);
+
+    for (guint k = 0; k < g_features->len; k++) {
+        char     *spec = g_ptr_array_index (g_features, k);
+        char     *eq   = strchr (spec, '=');
+        gboolean  want = TRUE;
+        char     *name = g_strdup (spec);
+
+        if (eq) {
+            name[eq - spec] = '\0';
+            want = truthy (eq + 1);
+        }
+
+        gboolean found = FALSE;
+        for (gsize i = 0; i < n; i++) {
+            WebKitFeature *f  = webkit_feature_list_get (all, i);
+            const char    *id = webkit_feature_get_identifier (f);
+
+            if (!id || g_ascii_strcasecmp (id, name) != 0)
+                continue;
+
+            webkit_settings_set_feature_enabled (s, f, want);
+            LOG ("feature: %s = %s\n", id, want ? "on" : "off");
+            found = TRUE;
+            break;
+        }
+
+        if (!found)
+            g_printerr ("feature: no such feature '%s'"
+                        " (try --list-features)\n", name);
+        g_free (name);
+    }
+
+    webkit_feature_list_unref (all);
+}
+
+/* ------------------------------------------------------- process watch */
+
+/*
+ * A page that freezes with the web process at 100% CPU and gigabytes of
+ * memory is a runaway, and the moment to look at it is while it is
+ * happening. This samples the web process every few seconds and, when it
+ * is spinning, prints what its threads are doing - with no help from the
+ * process itself, which is the point.
+ */
+static gboolean g_proc_watch = TRUE;
+
+typedef struct { pid_t pid; guint64 ticks; gint64 at; guint hot; gboolean told; } ProcSample;
+static ProcSample g_ps;
+
+static gboolean
+proc_stat (pid_t pid, guint64 *ticks, guint64 *rss_kb, char *state)
+{
+    char *p = g_strdup_printf ("/proc/%d/stat", (int) pid), *s = NULL;
+    gboolean ok = g_file_get_contents (p, &s, NULL, NULL);
+    g_free (p);
+    if (!ok) return FALSE;
+
+    char *rp = strrchr (s, ')');             /* fields after the comm */
+    if (!rp) { g_free (s); return FALSE; }
+
+    char **f = g_strsplit (rp + 2, " ", -1);   /* f[0] = state */
+    gboolean good = g_strv_length (f) > 22;
+    if (good) {
+        *state  = f[0][0];
+        *ticks  = g_ascii_strtoull (f[11], NULL, 10) + g_ascii_strtoull (f[12], NULL, 10);
+        *rss_kb = g_ascii_strtoull (f[21], NULL, 10) * (guint64) (sysconf (_SC_PAGESIZE) / 1024);
+    }
+    g_strfreev (f);
+    g_free (s);
+    return good;
+}
+
+static pid_t
+web_process_pid (void)
+{
+    GDir *d = g_dir_open ("/proc", 0, NULL);
+    const char *n; pid_t self = getpid (), found = 0;
+    GHashTable *parent = g_hash_table_new (g_direct_hash, g_direct_equal);
+    GPtrArray  *webs   = g_ptr_array_new ();
+    if (!d) return 0;
+
+    while ((n = g_dir_read_name (d))) {
+        if (!g_ascii_isdigit (n[0])) continue;
+        char *p = g_strdup_printf ("/proc/%s/stat", n), *s = NULL;
+        if (g_file_get_contents (p, &s, NULL, NULL)) {
+            char *rp = strrchr (s, ')');
+            if (rp) {
+                pid_t pid  = (pid_t) atoi (n);
+                pid_t ppid = (pid_t) g_ascii_strtoll (rp + 4, NULL, 10);
+                g_hash_table_insert (parent, GINT_TO_POINTER (pid), GINT_TO_POINTER (ppid));
+                if (strstr (s, "(WebKitWebProc"))
+                    g_ptr_array_add (webs, GINT_TO_POINTER (pid));
+            }
+            g_free (s);
+        }
+        g_free (p);
+    }
+    g_dir_close (d);
+
+    /* ours may be a child, or a grandchild behind bwrap: walk up */
+    for (guint i = 0; i < webs->len && !found; i++) {
+        pid_t p = GPOINTER_TO_INT (g_ptr_array_index (webs, i)), q = p;
+        for (int hops = 0; q > 1 && hops < 8; hops++) {
+            q = GPOINTER_TO_INT (g_hash_table_lookup (parent, GINT_TO_POINTER (q)));
+            if (q == self) { found = p; break; }
+        }
+    }
+    g_ptr_array_free (webs, TRUE);
+    g_hash_table_destroy (parent);
+    return found;
+}
+
+/* The same [hh:mm:ss.mmm] the rest of the log carries, so a freeze can
+ * be lined up with what the page was doing at the time. */
+static const char *
+watch_stamp (void)
+{
+    static char buf[24];
+    GDateTime *dt = g_date_time_new_now_local ();
+    g_snprintf (buf, sizeof buf, "[%02d:%02d:%02d.%03d]",
+                g_date_time_get_hour (dt), g_date_time_get_minute (dt),
+                g_date_time_get_second (dt),
+                g_date_time_get_microsecond (dt) / 1000);
+    g_date_time_unref (dt);
+    return buf;
+}
+
+/* GStreamer names its streaming threads after the pad they push from:
+ * "queue0:src", "multiqueue1:src", "rtpgccbwe1:src". */
+static gboolean
+is_media_thread (const char *comm)
+{
+    return comm && (g_str_has_suffix (comm, ":src") || g_str_has_suffix (comm, ":sink") ||
+                    g_str_has_prefix (comm, "gst") || strstr (comm, "queue"));
+}
+
+/* Prints the busy threads; returns how many of them there were, and in
+ * *media how many of those were GStreamer's. */
+static guint
+threads_report (pid_t pid, guint *media)
+{
+    guint busy = 0;
+    *media = 0;
+    char *tdir = g_strdup_printf ("/proc/%d/task", (int) pid);
+    GDir *td = g_dir_open (tdir, 0, NULL);
+    const char *tn;
+    while (td && (tn = g_dir_read_name (td))) {
+        char *p, *comm = NULL, *wchan = NULL, *stat = NULL; char st = '?';
+        p = g_strdup_printf ("%s/%s/comm", tdir, tn);  g_file_get_contents (p, &comm, NULL, NULL);  g_free (p);
+        p = g_strdup_printf ("%s/%s/wchan", tdir, tn); g_file_get_contents (p, &wchan, NULL, NULL); g_free (p);
+        p = g_strdup_printf ("%s/%s/stat", tdir, tn);
+        if (g_file_get_contents (p, &stat, NULL, NULL)) { char *rp = strrchr (stat, ')'); if (rp && rp[2]) st = rp[2]; }
+        g_free (p);
+        if (comm) g_strchomp (comm);
+        if (wchan) g_strchomp (wchan);
+        /* only the threads that are doing something: running, or blocked */
+        if (st == 'R' || st == 'D') {
+            LOG ("watch:   %-6s %c  %-18s %s\n", tn, st, comm ? comm : "?",
+                 (wchan && *wchan && strcmp (wchan, "0")) ? wchan : "(running)");
+            busy++;
+            if (is_media_thread (comm))
+                (*media)++;
+        }
+        g_free (comm); g_free (wchan); g_free (stat);
+    }
+    if (td) g_dir_close (td);
+    g_free (tdir);
+    return busy;
+}
+
+static gboolean
+proc_watch_tick (gpointer u)
+{
+    (void) u;
+    pid_t pid = web_process_pid ();
+    if (!pid) return G_SOURCE_CONTINUE;
+
+    guint64 ticks = 0, rss = 0; char state = '?';
+    if (!proc_stat (pid, &ticks, &rss, &state)) return G_SOURCE_CONTINUE;
+
+    gint64 now = g_get_monotonic_time ();
+    if (g_ps.pid == pid && g_ps.at) {
+        double secs = (now - g_ps.at) / 1e6;
+        double cpu  = 100.0 * (ticks - g_ps.ticks) / (double) sysconf (_SC_CLK_TCK) / secs;
+
+        if (cpu >= 90.0) {
+            g_ps.hot++;
+        } else {
+            /* a spin we reported has ended: say when, so the log shows
+             * how long the page was frozen */
+            if (g_ps.told)
+                LOG ("watch: %s web process %d calm again after about %us "
+                     "(%.0f%% cpu now)\n", watch_stamp (), (int) pid,
+                     g_ps.hot * 5, cpu);
+            g_ps.hot  = 0;
+            g_ps.told = FALSE;
+        }
+
+        /* three samples in a row spinning: say so, and say where */
+        if (g_ps.hot == 3 || (g_ps.hot > 3 && g_ps.hot % 12 == 0)) {
+            guint media = 0, busy;
+
+            LOG ("watch: %s web process %d is spinning: %.0f%% cpu, %.1f GB resident, "
+                 "for %ds. Threads running or blocked:\n", watch_stamp (),
+                 (int) pid, cpu, rss / 1048576.0, g_ps.hot * 5);
+            busy = threads_report (pid, &media);
+            g_ps.told = TRUE;
+
+            /* The hint depends on who is busy: media threads are not
+             * JavaScript, and --no-jit would only send you the wrong way. */
+            if (busy && media * 2 >= busy)
+                LOG ("watch: the busy threads are GStreamer's (media), not\n"
+                     "watch: JavaScript - --no-jit will not help with this one\n");
+            else
+                LOG ("watch: if this recurs, try --no-jit first; a self-built\n"
+                     "watch: JavaScriptCore that spins is usually its JIT\n");
+        }
+    }
+    g_ps.pid = pid; g_ps.ticks = ticks; g_ps.at = now;
+    return G_SOURCE_CONTINUE;
+}
+
+/* ------------------------------------------------------------ view kick */
+
+/*
+ * The page area can go stale while everything else keeps working: the
+ * web process still renders, the popups still draw, but the buffer the
+ * page hands over stops being presented after a resize. Hiding the view
+ * for one loop iteration and showing it again with a fresh allocation
+ * makes the widget re-import what the web process has, without a
+ * reload and without losing the page.
+ */
+static gboolean
+view_kick_show (gpointer u)
+{
+    Win *w = u;
+    gtk_widget_set_visible (GTK_WIDGET (w->view), TRUE);
+    gtk_widget_queue_resize (GTK_WIDGET (w->view));
+    gtk_widget_queue_draw (GTK_WIDGET (w->view));
+    gtk_widget_grab_focus (GTK_WIDGET (w->view));
+    LOG ("view: kicked (re-presented without reloading)\n");
+    return G_SOURCE_REMOVE;
+}
+
+static void
+view_kick (Win *w)
+{
+    gtk_widget_set_visible (GTK_WIDGET (w->view), FALSE);
+    g_idle_add (view_kick_show, w);
+}
+
+/* ------------------------------------------------------ main-loop watch */
+
+/*
+ * The process watch above runs on the main loop, so it cannot report the
+ * one thing that stops the main loop: this process freezing. A thread
+ * with a heartbeat can. It prints straight to the real stderr, since the
+ * message filter also lives on the main loop.
+ */
+static volatile gint g_heartbeat;
+
+/*
+ * A window can stop updating while the process is perfectly healthy:
+ * GTK paints only when the compositor returns a frame callback, and if
+ * one never comes after a resize, the main loop keeps running and nothing
+ * is ever drawn again. That looks like a freeze and is not one. Tracking
+ * paints against paint requests tells the two apart.
+ */
+static volatile gint64 g_last_paint;      /* monotonic us of the last frame */
+static volatile gint64 g_last_request;    /* ... of the last request to paint */
+
+static void
+on_frame_after_paint (GdkFrameClock *fc, gpointer u)
+{
+    (void) fc; (void) u;
+    g_last_paint = g_get_monotonic_time ();
+}
+
+static void
+on_frame_update (GdkFrameClock *fc, gpointer u)
+{
+    (void) fc; (void) u;
+    g_last_request = g_get_monotonic_time ();
+}
+
+static void
+frame_watch_attach (GtkWidget *win)
+{
+    GdkFrameClock *fc = gtk_widget_get_frame_clock (win);
+    if (!fc)
+        return;
+    g_signal_connect (fc, "after-paint", G_CALLBACK (on_frame_after_paint), NULL);
+    g_signal_connect (fc, "update",      G_CALLBACK (on_frame_update), NULL);
+    g_last_paint = g_last_request = g_get_monotonic_time ();
+}
+
+static gboolean
+heartbeat_tick (gpointer u)
+{
+    (void) u;
+    g_atomic_int_inc (&g_heartbeat);
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+raw_err (const char *s)
+{
+    int fd = g_real_stderr >= 0 ? g_real_stderr : STDERR_FILENO;
+    (void) !write (fd, s, strlen (s));
+}
+
+static gpointer
+ui_watch_thread (gpointer u)
+{
+    (void) u;
+    gint last = g_atomic_int_get (&g_heartbeat), stuck = 0;
+
+    gint64 frame_warned = 0;
+
+    for (;;) {
+        g_usleep (G_USEC_PER_SEC);
+        gint now = g_atomic_int_get (&g_heartbeat);
+
+        /* main loop alive: is the window still being painted? */
+        if (now != last) {
+            last = now; stuck = 0;
+            gint64 t = g_get_monotonic_time ();
+            gint64 lp = g_last_paint, lr = g_last_request;
+            if (lr > lp && t - lp > 5 * G_USEC_PER_SEC && lp != frame_warned) {
+                frame_warned = lp;
+                char buf[320];
+                g_snprintf (buf, sizeof buf,
+                    "\nwatch: main loop is running but NO FRAME HAS BEEN PAINTED for %.0fs "
+                    "although one was requested.\n"
+                    "watch: GTK is waiting for a frame callback the compositor never sent - "
+                    "this follows a resize on some Wayland compositors.\n"
+                    "watch: the process is healthy; the window is what stopped. "
+                    "Try: --gsk cairo, or resize the window again.\n",
+                    (t - lp) / 1e6);
+                raw_err (buf);
+            }
+            continue;
+        }
+
+        stuck++;
+        if (stuck != 5 && stuck % 30 != 0)
+            continue;
+
+        /* the main loop has not run for five seconds: say where it is */
+        char  buf[256];
+        g_snprintf (buf, sizeof buf,
+                    "\nwatch: THIS PROCESS (%d) main loop has not run for %ds. "
+                    "Its running/blocked threads:\n", (int) getpid (), stuck);
+        raw_err (buf);
+
+        GDir *td = g_dir_open ("/proc/self/task", 0, NULL);
+        const char *tn;
+        while (td && (tn = g_dir_read_name (td))) {
+            char *p, *comm = NULL, *wchan = NULL, *stat = NULL; char st = '?';
+            p = g_strdup_printf ("/proc/self/task/%s/comm", tn);  g_file_get_contents (p, &comm, NULL, NULL);  g_free (p);
+            p = g_strdup_printf ("/proc/self/task/%s/wchan", tn); g_file_get_contents (p, &wchan, NULL, NULL); g_free (p);
+            p = g_strdup_printf ("/proc/self/task/%s/stat", tn);
+            if (g_file_get_contents (p, &stat, NULL, NULL)) { char *rp = strrchr (stat, ')'); if (rp && rp[2]) st = rp[2]; }
+            g_free (p);
+            if (comm) g_strchomp (comm);
+            if (wchan) g_strchomp (wchan);
+            /* the main thread always, whatever it is doing: it is the one
+             * that stopped; the others only if they are busy or blocked */
+            if (st == 'R' || st == 'D' || atoi (tn) == (int) getpid ()) {
+                g_snprintf (buf, sizeof buf, "watch:   %-6s %c  %-18s %s\n", tn, st,
+                            comm ? comm : "?",
+                            (wchan && *wchan && strcmp (wchan, "0")) ? wchan : "(running)");
+                raw_err (buf);
+            }
+            g_free (comm); g_free (wchan); g_free (stat);
+        }
+        if (td) g_dir_close (td);
+        raw_err ("watch: a main thread waiting in a GPU/Vulkan/DRM call is the renderer:"
+                 " try --gsk gl, then --gsk cairo\n");
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------ log filter */
+
+/*
+ * Whatever is still in the pipe when the loop ends would otherwise be
+ * dropped: the watch never runs again. Drained by hand at shutdown, or the
+ * last thing printed before exit is silently lost.
+ */
+static void
+noise_drain (void)
+{
+    if (g_real_stderr < 0 || g_noise_fd < 0)
+        return;
+
+    fflush (stderr);
+
+    char    buf[4096];
+    ssize_t n;
+
+    while ((n = read (g_noise_fd, buf, sizeof buf)) > 0)
+        (void) !write (g_real_stderr, buf, (size_t) n);
+}
+
+static void
+noise_summary (void)
+{
+    if (!g_noise || g_real_stderr < 0)
+        return;
+
+    noise_drain ();
+
+    GHashTableIter it;
+    gpointer       k, v;
+    gboolean       header = FALSE;
+
+    g_hash_table_iter_init (&it, g_noise);
+    while (g_hash_table_iter_next (&it, &k, &v)) {
+        guint n = GPOINTER_TO_UINT (v);
+        if (n <= NOISE_SHOW)
+            continue;
+
+        if (!header) {
+            const char *h = "--- repeated messages, shown twice each above ---\n";
+            (void) !write (g_real_stderr, h, strlen (h));
+            header = TRUE;
+        }
+
+        char *line = g_strdup_printf ("  %5u x  %s\n", n, (char *) k);
+        (void) !write (g_real_stderr, line, strlen (line));
+        g_free (line);
+    }
+}
+
+static gboolean
+on_stderr_line (GIOChannel *ch, GIOCondition cond, gpointer u)
+{
+    (void) u;
+    char   *line = NULL;
+    gsize   len  = 0;
+
+    if (cond & (G_IO_HUP | G_IO_ERR))
+        return G_SOURCE_REMOVE;
+
+    while (g_io_channel_read_line (ch, &line, &len, NULL, NULL) == G_IO_STATUS_NORMAL
+           && line) {
+        char *key = g_strchomp (g_strdup (line));
+        guint n   = 1;
+
+        if (*key) {
+            gpointer had = g_hash_table_lookup (g_noise, key);
+            n = GPOINTER_TO_UINT (had) + 1;
+
+            if (had || g_hash_table_size (g_noise) < NOISE_MAX)
+                g_hash_table_insert (g_noise, g_strdup (key), GUINT_TO_POINTER (n));
+        }
+
+        if (n <= NOISE_SHOW)
+            (void) !write (g_real_stderr, line, len);
+
+        g_free (key);
+        g_free (line);
+        line = NULL;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+/*
+ * A fatal error prints to stderr and then aborts, and the message is
+ * still sitting in the pipe when the process dies: the main loop, which
+ * would have printed it, never runs again. So the last act before dying
+ * is to drain the pipe by hand, with nothing but read() and write(),
+ * which are safe to call from a signal handler.
+ */
+static void
+on_fatal_signal (int sig)
+{
+    int fd = g_real_stderr >= 0 ? g_real_stderr : STDERR_FILENO;
+
+    if (g_real_stderr >= 0 && g_noise_fd >= 0) {
+        char    buf[4096];
+        ssize_t n;
+        while ((n = read (g_noise_fd, buf, sizeof buf)) > 0)
+            (void) !write (fd, buf, (size_t) n);
+    }
+
+    /*
+     * Some aborts say nothing at all. The stack is then the only witness:
+     * which library was on it names the layer, even without symbols for
+     * every frame. backtrace_symbols_fd() is safe to call here.
+     */
+    {
+        const char *what = sig == SIGABRT ? "abort" : sig == SIGSEGV ? "segfault"
+                         : sig == SIGBUS  ? "bus error" : sig == SIGTRAP ? "trap" : "signal";
+        char head[128];
+        int  len = g_snprintf (head, sizeof head,
+                               "\n---- fatal: %s in this process, stack at the time: ----\n", what);
+        (void) !write (fd, head, (size_t) len);
+
+        void *frames[64];
+        int   n = backtrace (frames, 64);
+        backtrace_symbols_fd (frames, n, fd);
+
+        const char *tail = "---- (a frame in libgtk/libgdk is the toolkit, libEGL/libGL or "
+                           "*_dri.so the driver, libwayland-client the compositor link) ----\n";
+        (void) !write (fd, tail, strlen (tail));
+    }
+
+    signal (sig, SIG_DFL);
+    raise (sig);
+}
+
+/* Must run before any child is spawned, so they inherit the pipe. */
+static void
+noise_filter_start (void)
+{
+    int fds[2];
+
+    if (g_all_messages)
+        return;
+
+    /*
+     * Not when a firehose was asked for. GST_DEBUG at a high level writes
+     * faster than this can drain, the pipe fills, and the process that is
+     * writing blocks - which looked exactly like --gst-debug producing no
+     * output at all.
+     */
+    if (g_getenv ("GST_DEBUG") || g_getenv ("WEBKIT_DEBUG"))
+        return;
+
+    if (pipe (fds) != 0)
+        return;
+
+    /* headroom, so a burst does not stall the writer before we read it */
+#ifdef F_SETPIPE_SZ
+    fcntl (fds[1], F_SETPIPE_SZ, 1 << 20);
+#endif
+
+    g_real_stderr = dup (STDERR_FILENO);
+    if (g_real_stderr < 0) {
+        close (fds[0]);
+        close (fds[1]);
+        return;
+    }
+
+    dup2 (fds[1], STDERR_FILENO);
+    close (fds[1]);
+
+    g_noise = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+    g_noise_fd = fds[0];
+
+    /* non-blocking, so the drain in a signal handler cannot hang */
+    fcntl (fds[0], F_SETFL, fcntl (fds[0], F_GETFL) | O_NONBLOCK);
+    signal (SIGABRT, on_fatal_signal);   /* abort(), assert, C++ terminate */
+    signal (SIGTRAP, on_fatal_signal);   /* g_error() ends in a breakpoint */
+    signal (SIGSEGV, on_fatal_signal);
+    signal (SIGBUS,  on_fatal_signal);
+
+    GIOChannel *ch = g_io_channel_unix_new (fds[0]);
+    g_io_channel_set_flags (ch, G_IO_FLAG_NONBLOCK, NULL);
+    g_io_channel_set_encoding (ch, NULL, NULL);
+    g_io_add_watch (ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_stderr_line, NULL);
+    g_io_channel_unref (ch);
+}
+
 /* --------------------------------------------------------------- config */
 
 /*
@@ -919,10 +1812,11 @@ typedef struct {
     Color bg, tile, tile_sel, tile_hover, mini_bg, card, card_hover, card_focus;
     Color text, subtext, dim, accent, hl, hltext, hint, urgent, outline;
     Color find_hl;          /* the match <mod>+F is sitting on */
+    Color start_bg;         /* flat background of the start page */
     Color current, match, shadow;   /* carried for interchange */
 
     /* geometry */
-    double radius, border, pad, gap, win_gap, ui_scale;
+    double radius, border, pad, gap, win_gap, margin, ui_scale;
 
     /* text */
     int   label_px, title_px, hint_px, ws_px;
@@ -1014,6 +1908,9 @@ theme_defaults (void)
     t->urgent     = rgba_hex (0xe0533cff);
     t->outline    = rgba_hex (0x0a0e1499);
     t->find_hl    = rgba_hex (0x9fd6f5ff);   /* pale blue, not the orange */
+    /* The start page is a full page, not a panel: flat and opaque, so it
+     * never mixes with whatever WebKit paints underneath. Soft paper. */
+    t->start_bg   = rgba_hex (0xf3f0e9ff);
     t->current    = rgba_hex (0x4fb3a5ff);
     t->match      = rgba_hex (0xb58ae0ff);
     t->shadow     = rgba_hex (0x00000073);
@@ -1022,6 +1919,7 @@ theme_defaults (void)
     t->border   = 3.0;
     t->pad      = 10.0;
     t->gap      = 14.0;
+    t->margin   = 26.0;        /* clearance from the window edge */
     t->win_gap  = 5.0;
     t->ui_scale = 1.0;
 
@@ -1076,8 +1974,7 @@ cfg_set (const char *k, const char *v)
                                    return parse_color (v, &t->mini_bg);
     if (key_is (k, "current"))     return parse_color (v, &t->current);
     if (key_is (k, "match"))       return parse_color (v, &t->match);
-    if (key_is (k, "shadow_color") || key_is (k, "shadow"))
-                                   return parse_color (v, &t->shadow);
+    if (key_is (k, "shadow_color")) return parse_color (v, &t->shadow);
     if (key_is (k, "card_hover") || key_is (k, "hover"))
                                   return parse_color (v, &t->card_hover);
     if (key_is (k, "text"))       return parse_color (v, &t->text);
@@ -1091,12 +1988,16 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "outline"))    return parse_color (v, &t->outline);
     if (key_is (k, "find_hl") || key_is (k, "find"))
                                   return parse_color (v, &t->find_hl);
+    if (key_is (k, "start_bg") || key_is (k, "startpage_bg"))
+                                  return parse_color (v, &t->start_bg);
 
     /* ---- geometry, shared with swov ---- */
     if (key_is (k, "radius") || key_is (k, "corner")) { t->radius = g_ascii_strtod (v, NULL); return TRUE; }
     if (key_is (k, "border"))   { t->border  = g_ascii_strtod (v, NULL); return TRUE; }
     if (key_is (k, "pad"))      { t->pad     = g_ascii_strtod (v, NULL); return TRUE; }
     if (key_is (k, "gap"))      { t->gap     = g_ascii_strtod (v, NULL); return TRUE; }
+    if (key_is (k, "margin") || key_is (k, "screen_pad"))
+                                { t->margin  = g_ascii_strtod (v, NULL); return TRUE; }
     if (key_is (k, "win_gap") || key_is (k, "window_gap")) { t->win_gap = g_ascii_strtod (v, NULL); return TRUE; }
     if (key_is (k, "ui_scale") || key_is (k, "font_scale") || key_is (k, "text_scale")) {
         t->ui_scale = g_ascii_strtod (v, NULL);
@@ -1118,6 +2019,14 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "title"))         { set_str (&g_title, v); return TRUE; }
     if (key_is (k, "app_id"))        { set_str (&g_app_id, v); return TRUE; }
     if (key_is (k, "clip_cmd"))      { set_str (&g_clip_cmd, v); return TRUE; }
+    if (key_is (k, "player"))        { set_str (&g_player, v); return TRUE; }
+    if (key_is (k, "image_viewer"))  { set_str (&g_image_viewer, v); return TRUE; }
+    if (key_is (k, "media_mode"))    { g_media_mode = truthy (v); return TRUE; }
+    if (key_is (k, "player_match")) {
+        g_strfreev (g_player_match);
+        g_player_match = g_strsplit_set (v, ", ", -1);
+        return TRUE;
+    }
     if (key_is (k, "download_dir"))  { set_str (&g_download_dir, v); return TRUE; }
     if (key_is (k, "profile"))       { set_str (&g_profile, v); return TRUE; }
     if (key_is (k, "user_agent"))    { set_str (&g_user_agent, v); return TRUE; }
@@ -1138,8 +2047,42 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "mod"))           return parse_mod (v);
 
     /* search_s = https://example.com/?q={} */
+    if (key_is (k, "shared_array_buffer")) { g_shared_ab = truthy (v); return TRUE; }
+    /* the rendering escape hatches, as settled preferences */
+    if (key_is (k, "no_dmabuf"))      { g_no_dmabuf      = truthy (v); return TRUE; }
+    if (key_is (k, "no_compositing")) { g_no_compositing = truthy (v); return TRUE; }
+    if (key_is (k, "no_gpu"))         { g_no_gpu         = truthy (v); return TRUE; }
+    if (key_is (k, "no_hw_decode"))   { g_no_hw_decode   = truthy (v); return TRUE; }
+
+    if (key_is (k, "feature")) {           /* feature = Name[=on|off], repeatable */
+        if (!g_features)
+            g_features = g_ptr_array_new_with_free_func (g_free);
+        g_ptr_array_add (g_features, g_strdup (v));
+        return TRUE;
+    }
+    if (key_is (k, "gsk") || key_is (k, "renderer")) {
+        /* the default is a literal, so never freed; a config value is
+         * kept for the life of the process, which is the same thing */
+        g_gsk_renderer = g_strdup (v);
+        return TRUE;
+    }
+
+    if (key_is (k, "media")) {
+        if (!g_ascii_strcasecmp (v, "allow"))      g_media_policy = MEDIA_ALLOW;
+        else if (!g_ascii_strcasecmp (v, "deny")) { g_media_policy = MEDIA_DENY; g_deny_media = TRUE; }
+        else if (!g_ascii_strcasecmp (v, "ask"))   g_media_policy = MEDIA_ASK;
+        else g_printerr ("config: media must be ask, allow or deny\n");
+        return TRUE;
+    }
+
+    if (key_is (k, "search_default") || key_is (k, "default_search")) {
+        g_free (g_search_default);
+        g_search_default = g_strdup (v);
+        return TRUE;
+    }
+
     if (g_ascii_strncasecmp (k, "search_", 7) == 0 && k[7]) {
-        search_set (k + 7, v);
+        search_set (k + 7, v, FALSE);
         return TRUE;
     }
 
@@ -1148,6 +2091,12 @@ cfg_set (const char *k, const char *v)
 
     return FALSE;
 }
+
+/* Whether an unrecognised key is worth mentioning. It is in our own file,
+ * or on the command line, where it means a typo. It is not in swov's file,
+ * which is full of keys for swov. */
+static gboolean g_cfg_strict = TRUE;
+static guint    g_cfg_ignored;
 
 static void
 cfg_set_line (const char *pair)
@@ -1159,8 +2108,12 @@ cfg_set_line (const char *pair)
     char *k = g_strstrip (g_strndup (pair, (gsize) (eq - pair)));
     char *v = g_strstrip (g_strdup (eq + 1));
 
-    if (*k && !cfg_set (k, v))
-        LOG ("config: unknown key '%s' (ignored)\n", k);
+    if (*k && !cfg_set (k, v)) {
+        if (g_cfg_strict)
+            LOG ("config: unknown key '%s' (ignored)\n", k);
+        else
+            g_cfg_ignored++;
+    }
 
     g_free (k);
     g_free (v);
@@ -1196,7 +2149,14 @@ cfg_load_file (const char *path)
 
     g_strfreev (lines);
     g_free (data);
-    LOG ("config: read %s\n", path);
+
+    if (g_cfg_ignored)
+        LOG ("config: read %s (%u keys are not ours, ignored)\n",
+             path, g_cfg_ignored);
+    else
+        LOG ("config: read %s\n", path);
+
+    g_cfg_ignored = 0;
     return TRUE;
 }
 
@@ -1217,7 +2177,10 @@ cfg_load_default_chain (const char *app)
     char *shared = cfg_path_for ("swov");
     char *own    = cfg_path_for (app);
 
+    g_cfg_strict = FALSE;              /* swov's file, swov's keys */
     cfg_load_file (shared);
+
+    g_cfg_strict = TRUE;               /* ours: an unknown key is a typo */
     cfg_load_file (own);
 
     g_free (shared);
@@ -1281,8 +2244,10 @@ usage (const char *argv0, gboolean to_stdout)
     g_string_append_printf (s, "usage: %s [%s] [options]\n"
 "\n"
 "  With no address the window comes up on a start page carrying the\n"
-"  program's name, version and the three keys worth knowing. It is drawn\n"
-"  from the same palette as the panels.\n"
+"  program's name, version and the three keys worth knowing, on one flat\n"
+"  colour. The dot at the top opens a row of swatches - white and black\n"
+"  among them - and the one you click becomes the default, remembered in\n"
+"  ~/.local/share/wkview/start-bg. The text follows it, light or dark.\n"
 "\n"
 "  A local file needs three slashes: file:///tmp/index.html. A bare path\n"
 "  works too, ./index.html or /tmp/index.html, and anything without a\n"
@@ -1304,16 +2269,36 @@ usage (const char *argv0, gboolean to_stdout)
 "                      ctrl | alt | super | meta (default: ctrl)\n"
 "  --clip-cmd CMD      command used by %s+Y, gets the URL on stdin\n"
 "                      (default: \"%s\"; \"internal\" uses the GTK clipboard)\n"
+"  --player CMD        video player for media mode, e.g. mpv. Given here\n"
+"                      it also starts the window in media mode\n"
+"  --image-viewer CMD  image viewer for media mode, e.g. imv. Images are\n"
+"                      downloaded first, the viewer gets the file\n"
+"  --media             start in media mode (F2 toggles it): <mod>+click\n"
+"                      on a video sends it to the player, on an image or\n"
+"                      an image link to the viewer. A frame shows the mode\n"
+"  --player-match LIST which links are videos, comma separated parts of\n"
+"                      the address (default: YouTube videos, shorts and\n"
+"                      live, plus .mp4 .webm .mkv .m3u8 ... files)\n"
 "\n"
 "page:\n"
 "  --css FILE          inject FILE as a user stylesheet\n"
 "  --devtools          open the inspector once the first page commits\n"
 "  --no-media          deny camera / microphone / screen-share requests\n"
 "  --no-load-bar       do not draw the loading line at the top\n"
+"  --no-devtools       no inspector machinery at all (F12 does nothing).\n"
+"                      JavaScriptCore printing \"received NeedDebuggerBreak\n"
+"                      trap\" with no inspector open is the reason to try it\n"
+"  --no-jit            run JavaScript interpreted (JSC_useJIT=0). The one\n"
+"                      to try if the web process traps or crashes\n"
+"  --no-sandbox        run the web process unsandboxed. Lets it open the\n"
+"                      capture devices directly on a machine with no\n"
+"                      desktop portal. Says so on every run, because it\n"
+"                      does give up the sandbox\n"
 "  --no-gpu            hardware acceleration policy NEVER\n"
 "  --no-dmabuf         WEBKIT_DISABLE_DMABUF_RENDERER=1\n"
 "  --no-compositing    WEBKIT_DISABLE_COMPOSITING_MODE=1\n"
-"  --no-hw-decode      WEBKIT_GST_ENABLE_HW_DECODERS=0\n"
+"  --no-hw-decode      rank the hardware video decoders out\n"
+"                      (GST_PLUGIN_FEATURE_RANK), so software decodes\n"
 "                      the four to reach for when a machine comes back up\n"
 "                      and pages render blank or zero sized\n"
 "  --enable-middle-click-paste\n"
@@ -1353,6 +2338,10 @@ usage (const char *argv0, gboolean to_stdout)
 "  --clear-data        wipe the profile's data and cache before starting\n"
 "  --private           ephemeral session, no stored history, ignores\n"
 "                      --profile/--clear-data\n"
+"  --paths             print every directory and file either browser\n"
+"                      writes - settings, cookies, history, cache - with\n"
+"                      what is on disk now, then exit. Follows --profile\n"
+"                      and --private wherever they sit on the line\n"
 "  --user-agent UA     set an explicit user agent string\n"
 "  --ua-chrome | --ua-win-chrome | --ua-win-edge | --ua-firefox | --ua-safari\n"
 "\n"
@@ -1371,24 +2360,65 @@ usage (const char *argv0, gboolean to_stdout)
 "    %s\n"
 "    %s\n"
 "  Same format and the same key names as swov, so the palette can live in\n"
-"  swov's file and drive both. Keys either program does not know are\n"
-"  ignored with a note on stderr.\n"
+"  swov's file and drive both. That file is full of keys for swov, so they\n"
+"  are counted and ignored quietly; an unknown key in our own file, or on\n"
+"  the command line, is named, because there it means a typo.\n"
 "\n"
 "  look:    popup_width (how wide the panels want to be, %d)\n"
 "           list_rows (lines a popup list shows, %d)\n"
 "           bg tile tile_sel tile_hover card card_hover text subtext dim\n"
 "           accent hl hltext hint urgent outline find_hl\n"
-"           radius border pad gap win_gap ui_scale\n"
+"           start_bg (start page background; the palette on that page\n"
+"           overrides it once you click a swatch)\n"
+"           radius border pad gap win_gap margin ui_scale\n"
 "           font font_mono label_px title_px hint_px\n"
 "  ours:    title app_id zoom mod clip_cmd download_dir profile private\n"
 "           no_media page_title middle_click_paste select_all load_bar\n"
 "           css\n"
 "           user_agent quiet\n"
-"           always_overwrite\n"
+"           always_overwrite  search_default (which keyword needs no prefix)\n"
+"           gsk (GTK's renderer: gl, cairo, vulkan, ngl)\n"
+"           feature = Name[=on|off] (a WebKit runtime feature; repeatable)\n"
+"           no_dmabuf no_compositing no_gpu no_hw_decode (the same as the\n"
+"           --no-* flags, as settled preferences)\n"
 "           search_KEY (e.g. search_s = https://google.com/search?q={})\n"
 "\n"
 "misc:\n"
 "  -q, --quiet         silence the diagnostic output on stderr\n"
+"  --no-shared-array-buffer\n"
+"                      disable SharedArrayBuffer. It is on by default, as\n"
+"                      in other browsers, and WebKit still hands it only to\n"
+"                      pages that are cross-origin isolated\n"
+"  --jsc NAME=VALUE    set any JavaScriptCore option, e.g. useJIT=0.\n"
+"                      Repeatable\n"
+"  --feature NAME[=on|off]\n"
+"                      turn a WebKit runtime feature on or off. Several\n"
+"                      real sites need AllowWebGLInWorkers, which is off\n"
+"                      by default: without it a library that renders in a\n"
+"                      worker cannot get a WebGL context and falls back to\n"
+"                      the CPU. Repeatable\n"
+"  --gl-info           check the graphics stack the way this browser uses\n"
+"                      it - device nodes and whether you may open them,\n"
+"                      the GL context GTK gets, the renderer - then exit\n"
+"  --list-features [F] print the runtime features, optionally filtered,\n"
+"                      then exit\n"
+"  --gsk RENDERER      GTK's own renderer: gl (the default), cairo,\n"
+"                      vulkan, ngl, or auto to let GTK choose. GTK's own\n"
+"                      choice is Vulkan where the driver claims it, which\n"
+"                      has deadlocked on resize; GL gives up nothing here\n"
+"  --no-proc-watch     do not watch the web process. By default it is\n"
+"                      sampled every 5s and, when it spins at 90%%+ cpu for\n"
+"                      15s, its running and blocked threads are printed -\n"
+"                      the thing to read when a page freezes\n"
+"  --no-console        do not print the page's own console output, while\n"
+"                      keeping ours. A page that logs heavily makes the\n"
+"                      web process wait on every message\n"
+"  --all-messages      do not collapse repeated messages. By default a\n"
+"                      (collapsing is skipped anyway when GST_DEBUG or\n"
+"                      WEBKIT_DEBUG is set)\n"
+"                      line that keeps coming back - WebKit reporting the\n"
+"                      desktop portal unreachable, say - is shown twice\n"
+"                      and then counted, with the totals printed at exit\n"
 "  -h, --help          this text\n"
 "  -V, --version       version and build id, to tell two builds apart\n"
 "\n"
@@ -1418,12 +2448,18 @@ usage (const char *argv0, gboolean to_stdout)
 "                      ask for, with no question. \"everything\" lasts for\n"
 "                      this run only; put download_dir in a config file to\n"
 "                      keep it\n"
-"  <mod>+K             search keywords. The popup lists the ones it knows;\n"
-"                      add one as \"g URL\" with {} where the words go, and\n"
-"                      drop the one under the cursor with Delete or\n"
-"                      <mod>+X. Then \"g tree\" in the address popup\n"
-"                      searches for tree\n"
+"  <mod>+K             search keywords. The popup lists the ones it knows,\n"
+"                      marking which is the default. Add one as \"g URL\"\n"
+"                      with {} where the words go, tick the box to make it\n"
+"                      the default, drop the one under the cursor with\n"
+"                      Delete or <mod>+X. Then \"g tree\" searches with g,\n"
+"                      and a bare \"tree\" with the default one.\n"
+"                      Built in: g Google (the default), d DuckDuckGo,\n"
+"                      w Wikipedia, s SDL3 wiki. One of your own with the\n"
+"                      same letter replaces it\n"
 "  F1  or  <mod>+/     the key list, on screen\n"
+"  F2                  media mode on/off: <mod>+click sends videos to\n"
+"                      player and images to image_viewer\n"
 "  <mod>+J             back: one page back, then on into the stored history\n"
 "  <mod>+Shift+J       forward, the same way round\n"
 "\n"
@@ -1443,7 +2479,9 @@ usage (const char *argv0, gboolean to_stdout)
 "  <mod>+D             list the recent downloads for %d seconds\n"
 "  F12, <mod>+Shift+D  toggle the developer tools\n"
 "  <mod>+Shift+I       toggle the developer tools\n"
-"  <mod>+P             show the current URL (top right) for %d seconds\n"
+"  <mod>+P             show the whole current URL, top right: wrapped,\n"
+"                      never cut short, up longer the longer it is (from\n"
+"                      %d seconds). Press it again to put it away\n"
 "  <mod>+plus          zoom in\n"
 "  <mod>+minus         zoom out\n"
 "  <mod>+0             reset zoom to 100%%\n"
@@ -1610,7 +2648,7 @@ ui_css_install (void)
      * corners that face into the page are rounded, and the border on the
      * touching side is dropped so the panel sits flush. */
     g_string_append_printf (css,
-        "box.br-dl, box.br-omni, box.br-keys, label.br-toast, label.br-urltoast {"
+        "box.br-dl, box.br-omni, box.br-keys, box.br-perm, label.br-toast, label.br-urltoast {"
         "  background-color: %s;"
         "  border: %.0fpx solid %s;"
         "  padding: %.0fpx;"
@@ -1621,19 +2659,23 @@ ui_css_install (void)
         "  border-right-width: 0;"
         "}"
         /* centered on the top edge: both bottom corners are free */
-        "box.br-omni {"
+        "box.br-omni, box.br-perm {"
         "  border-radius: 0 0 %.0fpx %.0fpx;"
         "  border-top-width: 0;"
         "}"
         /* clear of every edge: all four corners are rounded */
         "box.br-keys { border-radius: %.0fpx; }"
-        /* top left corner: only the bottom right is free */
+        /* media mode: the accent round the page, nothing inside */
+        "box.br-media-frame { border: %.0fpx solid %s; background: none; }"
+        /* bottom left corner: only the top right is free */
         "label.br-urltoast {"
-        "  border-radius: 0 0 %.0fpx 0;"
-        "  border-left-width: 0; border-top-width: 0;"
+        "  border-radius: 0 %.0fpx 0 0;"
+        "  border-left-width: 0; border-bottom-width: 0;"
         "}",
         c_tile, t->border, c_outline, t->pad,
-        t->radius, t->radius, t->radius, t->radius, t->radius);
+        t->radius, t->radius, t->radius, t->radius,
+        MAX (t->border, 2.0), c_hl,
+        t->radius);
 
     /* ---- primary text ---- */
     g_string_append_printf (css,
@@ -1643,10 +2685,14 @@ ui_css_install (void)
         "}",
         c_text, ui_font, t->label_px * s);
 
+    /* an error toast: the same panel, the failure colour, and wrapped */
+    g_string_append_printf (css,
+        "label.br-toast.br-toast-error { color: %s; }", c_urgent);
+
     /* URLs and file names: fixed width, so they line up and elide sanely */
     g_string_append_printf (css,
         "entry.br-omni-entry, entry.br-omni-entry > text,"
-        "label.br-urltoast, label.br-dl-done, label.br-dl-failed,"
+        "label.br-urltoast, label.br-toast-url, label.br-dl-done, label.br-dl-failed,"
         "progressbar.br-dl-bar > text {"
         "  %s font-size: %.0fpx;"
         "}",
@@ -2176,13 +3222,31 @@ on_session_download_started (WebKitNetworkSession *session,
     download_wire (download);
 }
 
+static gboolean player_try (WebKitWebView *view, WebKitNavigationAction *act);
+static void     media_mode_toggle (Win *w);
+
 static gboolean
 on_decide_policy (WebKitWebView            *view,
                   WebKitPolicyDecision     *decision,
                   WebKitPolicyDecisionType  type,
                   gpointer                  u)
 {
-    (void) view; (void) u;
+    (void) u;
+
+    /* A <mod>+click reaches us as a new-window action (that is what the
+     * modifier means to WebKit, and why a site's own click handler lets
+     * it through), or as a plain navigation on some pages. Both carry
+     * the modifiers, so both are checked. */
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ||
+        type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+        WebKitNavigationAction *act = webkit_navigation_policy_decision_get_navigation_action (
+            WEBKIT_NAVIGATION_POLICY_DECISION (decision));
+        if (act && player_try (view, act)) {
+            webkit_policy_decision_ignore (decision);
+            return TRUE;
+        }
+        return FALSE;
+    }
 
     if (type != WEBKIT_POLICY_DECISION_TYPE_RESPONSE)
         return FALSE;
@@ -2219,7 +3283,6 @@ static const char *
 perm_type_name (WebKitPermissionRequest *req)
 {
     if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST (req))          return "user-media";
-    if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST (req))         return "device-info";
     if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST (req))        return "pointer-lock";
     if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST (req))         return "geolocation";
     if (WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST (req))        return "notification";
@@ -2229,48 +3292,539 @@ perm_type_name (WebKitPermissionRequest *req)
     return "other";
 }
 
-static gboolean
-media_permission (WebKitPermissionRequest *req)
+static Win *
+win_for_view (WebKitWebView *view)
 {
-    if (g_deny_media)
-        webkit_permission_request_deny (req);
-    else
+    for (guint i = 0; g_wins && i < g_wins->len; i++) {
+        Win *w = g_ptr_array_index (g_wins, i);
+        if (w->view == view)
+            return w;
+    }
+    return NULL;
+}
+
+/* ----------------------------------------------------------- media mode */
+
+static gboolean
+uri_has_ext (const char *uri, const char *const *exts)
+{
+    GUri *u = g_uri_parse (uri, G_URI_FLAGS_NONE, NULL);
+    if (!u)
+        return FALSE;
+
+    char    *path = g_ascii_strdown (g_uri_get_path (u), -1);
+    gboolean hit  = FALSE;
+    for (int i = 0; exts[i] && !hit; i++)
+        hit = g_str_has_suffix (path, exts[i]);
+
+    g_free (path);
+    g_uri_unref (u);
+    return hit;
+}
+
+static gboolean
+is_video_uri (const char *uri)
+{
+    const char *const *pats = g_player_match
+                            ? (const char *const *) g_player_match
+                            : PLAYER_MATCH_DEFAULT;
+
+    for (int i = 0; pats[i]; i++) {
+        if (!*pats[i])
+            continue;
+        if (!strcmp (pats[i], "*") || strstr (uri, pats[i]))
+            return TRUE;
+    }
+    return uri_has_ext (uri, VIDEO_EXT);
+}
+
+static gboolean
+is_image_uri (const char *uri)
+{
+    return uri_has_ext (uri, IMAGE_EXT);
+}
+
+static gboolean
+is_web_or_file (const char *uri)
+{
+    return uri && (g_str_has_prefix (uri, "http://") || g_str_has_prefix (uri, "https://") ||
+                   g_str_has_prefix (uri, "file://"));
+}
+
+/* Run CMD with ARG appended. The toast names what was sent where. */
+static gboolean
+media_spawn (Win *w, const char *cmd, const char *arg, const char *shown)
+{
+    char  **args = NULL;
+    GError *err  = NULL;
+    int     argc = 0;
+
+    if (!g_shell_parse_argv (cmd, &argc, &args, &err)) {
+        char *msg = g_strdup_printf ("media: cannot parse \"%s\": %s", cmd, err->message);
+        toast_error (w, msg);
+        g_free (msg);
+        g_clear_error (&err);
+        return FALSE;
+    }
+
+    char **full = g_new0 (char *, argc + 2);
+    for (int i = 0; i < argc; i++)
+        full[i] = args[i];
+    full[argc] = (char *) arg;
+
+    gboolean ok = g_spawn_async (NULL, full, NULL,
+                                 G_SPAWN_SEARCH_PATH |
+                                 G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                                 NULL, NULL, NULL, &err);
+    char *msg = ok ? g_strdup_printf ("%s  %s", args[0], shown)
+                   : g_strdup_printf ("media: cannot start %s: %s", args[0], err->message);
+    if (ok) {
+        LOG ("media: %s %s\n", cmd, arg);
+        if (w)
+            toast_show (w, msg, 2);
+    } else {
+        toast_error (w, msg);
+    }
+
+    g_free (msg);
+    g_clear_error (&err);
+    g_free (full);
+    g_strfreev (args);
+    return ok;
+}
+
+/*
+ * imv and most image viewers open files, not addresses, so a web image is
+ * fetched first - with the page as referer and the browser's user agent,
+ * which is what most image hosts check - into a private directory under
+ * the runtime dir. Files there older than an hour are swept on the next
+ * fetch; by then the viewer has long read them.
+ */
+#define MEDIA_IMG_MAX (64 * 1024 * 1024)
+
+static SoupSession *g_media_soup;
+
+typedef struct { GWeakRef view; char *uri; } ImgFetch;
+
+static char *
+media_tmp_dir (void)
+{
+    const char *base = g_get_user_runtime_dir ();
+    char *dir = g_build_filename (base && *base ? base : g_get_tmp_dir (),
+                                  "wkview-media", NULL);
+    g_mkdir_with_parents (dir, 0700);
+
+    /* sweep what earlier views left behind */
+    GDir *d = g_dir_open (dir, 0, NULL);
+    const char *n;
+    gint64 now = g_get_real_time () / G_USEC_PER_SEC;
+    while (d && (n = g_dir_read_name (d))) {
+        char *f = g_build_filename (dir, n, NULL);
+        GStatBuf st;
+        if (g_stat (f, &st) == 0 && now - (gint64) st.st_mtime > 3600)
+            g_unlink (f);
+        g_free (f);
+    }
+    if (d)
+        g_dir_close (d);
+    return dir;
+}
+
+static void
+img_fetch_free (ImgFetch *f)
+{
+    g_weak_ref_clear (&f->view);
+    g_free (f->uri);
+    g_free (f);
+}
+
+static void
+on_image_fetched (GObject *src, GAsyncResult *res, gpointer u)
+{
+    ImgFetch      *f    = u;
+    SoupMessage   *msg  = soup_session_get_async_result_message (SOUP_SESSION (src), res);
+    GError        *err  = NULL;
+    GBytes        *body = soup_session_send_and_read_finish (SOUP_SESSION (src), res, &err);
+    WebKitWebView *view = g_weak_ref_get (&f->view);
+    Win           *w    = view ? win_for_view (view) : NULL;
+    guint          code = msg ? soup_message_get_status (msg) : 0;
+
+    if (!body || code < 200 || code >= 300 || g_bytes_get_size (body) == 0 ||
+        g_bytes_get_size (body) > MEDIA_IMG_MAX) {
+        char *why = err ? g_strdup (err->message)
+                  : g_strdup_printf ("HTTP %u, %" G_GSIZE_FORMAT " bytes", code,
+                                     body ? g_bytes_get_size (body) : 0);
+        char *t = g_strdup_printf ("media: image not fetched: %s\n%s", why, f->uri);
+        toast_error (w, t);
+        g_free (t);
+        g_free (why);
+    } else {
+        char *dir  = media_tmp_dir ();
+        char *tmpl = g_build_filename (dir, "img-XXXXXX", NULL);
+        int   fd   = g_mkstemp (tmpl);
+        if (fd >= 0) {
+            gsize n;
+            const guint8 *p = g_bytes_get_data (body, &n);
+            gboolean wrote = write (fd, p, n) == (ssize_t) n;
+            close (fd);
+            if (wrote) {
+                media_spawn (w, g_image_viewer, tmpl, f->uri);
+            } else {
+                char *t = g_strdup_printf ("media: cannot write %s", tmpl);
+                toast_error (w, t);
+                g_free (t);
+            }
+        } else {
+            char *t = g_strdup_printf ("media: cannot create a file in %s", dir);
+            toast_error (w, t);
+            g_free (t);
+        }
+        g_free (tmpl);
+        g_free (dir);
+    }
+
+    if (body)
+        g_bytes_unref (body);
+    g_clear_error (&err);
+    if (view)
+        g_object_unref (view);
+    img_fetch_free (f);
+}
+
+static gboolean
+image_open (Win *w, const char *uri)
+{
+    if (!g_image_viewer || !*g_image_viewer || !is_web_or_file (uri))
+        return FALSE;
+
+    if (g_str_has_prefix (uri, "file://")) {
+        char *path = g_filename_from_uri (uri, NULL, NULL);
+        gboolean ok = path && media_spawn (w, g_image_viewer, path, uri);
+        g_free (path);
+        return ok;
+    }
+
+    if (!g_media_soup) {
+        g_media_soup = soup_session_new ();
+        soup_session_set_timeout (g_media_soup, 30);
+    }
+    const char *ua = g_settings ? webkit_settings_get_user_agent (g_settings) : NULL;
+    if (ua)
+        soup_session_set_user_agent (g_media_soup, ua);
+
+    SoupMessage *msg = soup_message_new ("GET", uri);
+    if (!msg)
+        return FALSE;
+    const char *page = w ? webkit_web_view_get_uri (w->view) : NULL;
+    if (page && g_str_has_prefix (page, "http"))
+        soup_message_headers_replace (soup_message_get_request_headers (msg), "Referer", page);
+
+    ImgFetch *f = g_new0 (ImgFetch, 1);
+    g_weak_ref_init (&f->view, w ? w->view : NULL);
+    f->uri = g_strdup (uri);
+
+    if (w)
+        toast_show (w, "fetching the image ...", URL_TOAST_SECONDS);
+    soup_session_send_and_read_async (g_media_soup, msg, G_PRIORITY_DEFAULT, NULL,
+                                      on_image_fetched, f);
+    g_object_unref (msg);
+    return TRUE;
+}
+
+static gboolean
+video_open (Win *w, const char *uri)
+{
+    if (!g_player || !*g_player || !is_web_or_file (uri))
+        return FALSE;
+    return media_spawn (w, g_player, uri, uri);
+}
+
+/* A link the page is following: an image or a video goes out, anything
+ * else is followed as usual. */
+static gboolean
+media_link (Win *w, const char *uri)
+{
+    if (!uri)
+        return FALSE;
+    if (is_image_uri (uri) && image_open (w, uri))
+        return TRUE;
+    if (is_video_uri (uri) && video_open (w, uri))
+        return TRUE;
+    return FALSE;
+}
+
+static gboolean
+player_try (WebKitWebView *view, WebKitNavigationAction *act)
+{
+    if (!g_media_mode)
+        return FALSE;
+    if (webkit_navigation_action_get_navigation_type (act) != WEBKIT_NAVIGATION_TYPE_LINK_CLICKED)
+        return FALSE;
+    if (!(webkit_navigation_action_get_modifiers (act) & g_mod))
+        return FALSE;
+    if (webkit_navigation_action_get_mouse_button (act) > 1)
+        return FALSE;                     /* middle click stays WebKit's */
+
+    WebKitURIRequest *req = webkit_navigation_action_get_request (act);
+    return media_link (win_for_view (view),
+                       req ? webkit_uri_request_get_uri (req) : NULL);
+}
+
+/* ------------------------------------------------ remembered decisions */
+
+static void
+perms_load (void)
+{
+    if (g_perms || !g_data_dir)
+        return;
+
+    g_perms = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+    char  *path = g_build_filename (g_data_dir, PERM_FILE, NULL);
+    char  *data = NULL;
+
+    if (g_file_get_contents (path, &data, NULL, NULL)) {
+        char **lines = g_strsplit (data, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            char **f = g_strsplit (lines[i], "\t", 3);
+            if (g_strv_length (f) >= 3 && !strcmp (f[1], "media"))
+                g_hash_table_insert (g_perms, g_strdup (f[0]), g_strdup (g_strstrip (f[2])));
+            g_strfreev (f);
+        }
+        g_strfreev (lines);
+        g_free (data);
+        LOG ("permissions: %u sites remembered in %s\n",
+             g_hash_table_size (g_perms), path);
+    }
+    g_free (path);
+}
+
+static void
+perms_save (void)
+{
+    if (!g_perms || !g_data_dir)
+        return;
+
+    GString       *s = g_string_new ("");
+    GHashTableIter it;
+    gpointer       k, v;
+
+    g_hash_table_iter_init (&it, g_perms);
+    while (g_hash_table_iter_next (&it, &k, &v))
+        g_string_append_printf (s, "%s\tmedia\t%s\n", (char *) k, (char *) v);
+
+    char *path = g_build_filename (g_data_dir, PERM_FILE, NULL);
+    g_file_set_contents (path, s->str, -1, NULL);
+    g_free (path);
+    g_string_free (s, TRUE);
+}
+
+static const char *
+perm_remembered (const char *host)
+{
+    perms_load ();
+    return (g_perms && host) ? g_hash_table_lookup (g_perms, host) : NULL;
+}
+
+static void
+perm_remember (const char *host, gboolean allow)
+{
+    perms_load ();
+    if (!g_perms || !host)
+        return;
+    g_hash_table_insert (g_perms, g_strdup (host), g_strdup (allow ? "allow" : "deny"));
+    perms_save ();
+}
+
+static char *
+req_host (WebKitWebView *view)
+{
+    const char *uri = webkit_web_view_get_uri (view);
+    if (!uri)
+        return NULL;
+
+    GUri *u = g_uri_parse (uri, G_URI_FLAGS_NONE, NULL);
+    if (!u)
+        return NULL;
+
+    char *host = g_strdup (g_uri_get_host (u));
+    g_uri_unref (u);
+    return host;
+}
+
+/* ---------------------------------------------------------- the prompt */
+
+/* Answer every request waiting on this prompt the same way, then hide it. */
+static void
+perm_answer (Win *w, gboolean allow)
+{
+    if (!w->permqueue)
+        return;
+
+    LOG ("perm: %s -> %s (%u request%s)\n",
+         w->permhost ? w->permhost : "?", allow ? "allow" : "deny",
+         w->permqueue->len, w->permqueue->len == 1 ? "" : "s");
+
+    for (guint i = 0; i < w->permqueue->len; i++) {
+        WebKitPermissionRequest *r = g_ptr_array_index (w->permqueue, i);
+        if (allow)
+            webkit_permission_request_allow (r);
+        else
+            webkit_permission_request_deny (r);
+    }
+
+    g_ptr_array_set_size (w->permqueue, 0);
+    if (w->permhost)
+        perm_remember (w->permhost, allow);
+
+    gtk_widget_set_visible (w->perm, FALSE);
+    if (allow && g_app->media_asked)
+        g_app->media_asked (TRUE, TRUE);
+    gtk_widget_grab_focus (GTK_WIDGET (w->view));
+}
+
+static void on_perm_allow (GtkButton *b, gpointer u) { (void) b; perm_answer (u, TRUE);  }
+static void on_perm_deny  (GtkButton *b, gpointer u) { (void) b; perm_answer (u, FALSE); }
+
+static void
+perm_prompt (Win *w, const char *host, gboolean audio, gboolean video)
+{
+    const char *what = (audio && video) ? "camera and microphone"
+                     : video            ? "camera"
+                     : audio            ? "microphone" : "media devices";
+    char *text = g_strdup_printf ("%s wants to use your %s", host ? host : "This page", what);
+
+    gtk_label_set_text (GTK_LABEL (w->permlabel), text);
+    g_free (text);
+
+    g_free (w->permhost);
+    w->permhost = g_strdup (host);
+
+    gtk_widget_set_visible (w->perm, TRUE);
+}
+
+/* Something is decided before the prompt ever appears: the policy from
+ * the command line, or a decision already remembered for this site. */
+static gboolean
+perm_settled (WebKitPermissionRequest *req, const char *host, gboolean *allowed)
+{
+    if (g_media_policy == MEDIA_ALLOW) { *allowed = TRUE;  goto done; }
+    if (g_media_policy == MEDIA_DENY)  { *allowed = FALSE; goto done; }
+
+    const char *had = perm_remembered (host);
+    if (!had)
+        return FALSE;
+    *allowed = !strcmp (had, "allow");
+
+done:
+    if (*allowed)
         webkit_permission_request_allow (req);
+    else
+        webkit_permission_request_deny (req);
     return TRUE;
 }
 
 static gboolean
 on_permission (WebKitWebView *view, WebKitPermissionRequest *req, gpointer u)
 {
-    (void) view; (void) u;
+    (void) u;
+    Win        *w    = win_for_view (view);
     const char *type = perm_type_name (req);
+    char       *host = req_host (view);
 
-    /* Answered synchronously and without a prompt: a permission dialog here
-     * is time the page's getUserMedia() timeout is already counting. */
+    /*
+     * Camera and microphone: ask, the way a browser does, and remember
+     * the answer per site. --allow-media and --deny-media answer without
+     * asking, for a kiosk or a script.
+     */
     if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST (req)) {
         WebKitUserMediaPermissionRequest *m = WEBKIT_USER_MEDIA_PERMISSION_REQUEST (req);
-        LOG ("perm: %s audio=%d video=%d screen=%d -> %s\n", type,
-             webkit_user_media_permission_is_for_audio_device (m),
-             webkit_user_media_permission_is_for_video_device (m),
-             webkit_user_media_permission_is_for_display_device (m),
-             g_deny_media ? "deny" : "allow");
-        return media_permission (req);
+        gboolean audio  = webkit_user_media_permission_is_for_audio_device (m);
+        gboolean video  = webkit_user_media_permission_is_for_video_device (m);
+        gboolean screen = webkit_user_media_permission_is_for_display_device (m);
+        gboolean allowed;
+
+        if (perm_settled (req, host, &allowed)) {
+            LOG ("perm: %s audio=%d video=%d screen=%d -> %s (%s)\n", type,
+                 audio, video, screen, allowed ? "allow" : "deny",
+                 g_media_policy == MEDIA_ASK ? "remembered" : "policy");
+            if (allowed && g_app->media_asked)
+                g_app->media_asked (audio, video);
+            g_free (host);
+            return TRUE;
+        }
+
+        if (!w) {                              /* no window to ask in */
+            webkit_permission_request_deny (req);
+            g_free (host);
+            return TRUE;
+        }
+
+        LOG ("perm: %s audio=%d video=%d screen=%d -> asking\n",
+             type, audio, video, screen);
+
+        if (!w->permqueue)
+            w->permqueue = g_ptr_array_new_with_free_func (g_object_unref);
+        g_ptr_array_add (w->permqueue, g_object_ref (req));
+
+        if (!gtk_widget_get_visible (w->perm))
+            perm_prompt (w, host, audio, video);
+        g_free (host);
+        return TRUE;
     }
 
-    /* needed so enumerateDevices() returns real labels, which most
-     * conferencing sites depend on */
-    if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST (req)) {
-        LOG ("perm: %s -> %s\n", type, g_deny_media ? "deny" : "allow");
-        return media_permission (req);
-    }
+    /* Device labels for enumerateDevices() are not decided here: WebKit
+     * 2.54 no longer emits WebKitDeviceInfoPermissionRequest and asks
+     * query-permission-state instead, see on_query_permission(). */
 
     if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST (req)) {
         webkit_permission_request_allow (req);
+        g_free (host);
         return TRUE;
     }
 
     LOG ("perm: %s -> deny\n", type);
     webkit_permission_request_deny (req);
+    g_free (host);
+    return TRUE;
+}
+
+/*
+ * navigator.permissions.query({name:'camera'|'microphone'}), and WebKit's
+ * own question before enumerateDevices() and getUserMedia(): is this site
+ * already allowed? Unanswered, WebKit's documented default is "prompt",
+ * so a remembered site would never be told it is allowed and device
+ * labels would stay hidden. Answered from the same per-site memory as the
+ * prompt, keyed by the top-level origin's host.
+ */
+static gboolean
+on_query_permission (WebKitWebView *view, WebKitPermissionStateQuery *q, gpointer u)
+{
+    (void) view; (void) u;
+    const char *name = webkit_permission_state_query_get_name (q);
+
+    if (g_strcmp0 (name, "camera") != 0 && g_strcmp0 (name, "microphone") != 0)
+        return FALSE;                          /* WebKit answers "prompt" */
+
+    WebKitSecurityOrigin *o    = webkit_permission_state_query_get_security_origin (q);
+    const char           *host = o ? webkit_security_origin_get_host (o) : NULL;
+    WebKitPermissionState st;
+
+    if (g_media_policy == MEDIA_ALLOW)
+        st = WEBKIT_PERMISSION_STATE_GRANTED;
+    else if (g_media_policy == MEDIA_DENY)
+        st = WEBKIT_PERMISSION_STATE_DENIED;
+    else {
+        const char *had = perm_remembered (host);
+        if (!had)
+            return FALSE;
+        st = !strcmp (had, "allow") ? WEBKIT_PERMISSION_STATE_GRANTED
+                                    : WEBKIT_PERMISSION_STATE_DENIED;
+    }
+
+    LOG ("perm: query %s for %s -> %s\n", name, host ? host : "?",
+         st == WEBKIT_PERMISSION_STATE_GRANTED ? "granted" : "denied");
+    webkit_permission_state_query_finish (q, st);
     return TRUE;
 }
 
@@ -2463,7 +4017,7 @@ history_delete (int pos)
         }
     }
 
-    LOG ("history: removed %s\n", hist_at (pos)->uri);
+    LOG ("history: moved %s to the end\n", hist_at (pos)->uri);
     g_ptr_array_remove_index (g_hist, pos);
 
     /* every window's cursor may now point past the end */
@@ -2592,6 +4146,29 @@ on_load_core (WebKitWebView *view, WebKitLoadEvent ev, gpointer u)
         gtk_widget_set_visible (w->loadbar, FALSE);
         history_note (w);
     }
+}
+
+/*
+ * A page that never appears is usually the web process dying, and until
+ * now only browser-big said so. The reason distinguishes a crash (a
+ * broken WebKit or JIT) from the memory limit from a deliberate kill.
+ */
+static void
+on_web_process_gone (WebKitWebView *view, WebKitWebProcessTerminationReason reason,
+                     gpointer u)
+{
+    (void) u;
+    const char *why = reason == WEBKIT_WEB_PROCESS_CRASHED
+                    ? "crashed"
+                    : reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT
+                    ? "exceeded its memory limit"
+                    : "was terminated";
+
+    g_printerr ("web process %s: %s\n", why,
+                webkit_web_view_get_uri (view) ? webkit_web_view_get_uri (view)
+                                               : "(no url)");
+    g_printerr ("web process: if this repeats, try --no-jit, then --no-gpu,\n"
+                "             then WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1\n");
 }
 
 static gboolean
@@ -2738,7 +4315,9 @@ omni_rebuild_searches (Win *w, const char *needle)
                 continue;
         }
 
-        char      *main_text = g_strdup_printf ("%s   %s", key, url);
+        gboolean   dflt      = !g_strcmp0 (key, g_search_default);
+        char      *main_text = g_strdup_printf ("%s   %s%s", key, url,
+                                                dflt ? "   (default)" : "");
         GtkWidget *row       = omni_row_new (main_text, NULL);
 
         g_object_set_data_full (G_OBJECT (row), "search", g_strdup (key), g_free);
@@ -2968,6 +4547,8 @@ omni_reflect (Win *w, GtkListBoxRow *row)
             return;
         owned = g_strdup_printf ("%s %s", search, url);
         text  = owned;
+        gtk_check_button_set_active (GTK_CHECK_BUTTON (w->omnialways),
+                                     !g_strcmp0 (search, g_search_default));
     } else if (rule) {
         text = g_hash_table_lookup (g_dlrules, rule);   /* its directory */
         if (!text)
@@ -3017,8 +4598,20 @@ omni_size_list (Win *w)
     if (win_h > 0)
         want = MIN (want, (int) (win_h * 0.7));
 
-    gtk_scrolled_window_set_min_content_height (GTK_SCROLLED_WINDOW (w->omniscroll), want);
-    gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (w->omniscroll), want);
+    if (want < row_h)
+        want = row_h;
+
+    /*
+     * GTK asserts that min <= max, checking against whichever value is
+     * already set, so either order can trip it. Clearing both to -1 first
+     * makes the pair order-independent.
+     */
+    GtkScrolledWindow *sw = GTK_SCROLLED_WINDOW (w->omniscroll);
+
+    gtk_scrolled_window_set_min_content_height (sw, -1);
+    gtk_scrolled_window_set_max_content_height (sw, -1);
+    gtk_scrolled_window_set_max_content_height (sw, want);
+    gtk_scrolled_window_set_min_content_height (sw, want);
 }
 
 static void
@@ -3082,6 +4675,15 @@ omni_hide (Win *w)
 static void
 omni_setup_scope (Win *w, OmniMode mode, const char *uri)
 {
+    if (mode == OMNI_SEARCH) {
+        gtk_widget_set_visible (w->omniscope, FALSE);
+        gtk_check_button_set_label (GTK_CHECK_BUTTON (w->omnialways),
+                                    "use this one when nothing is prefixed");
+        gtk_check_button_set_active (GTK_CHECK_BUTTON (w->omnialways), FALSE);
+        gtk_widget_set_visible (w->omnialways, TRUE);
+        return;
+    }
+
     if (mode != OMNI_DLDIR) {
         gtk_widget_set_visible (w->omniscope, FALSE);
         gtk_widget_set_visible (w->omnialways, FALSE);
@@ -3107,6 +4709,8 @@ omni_setup_scope (Win *w, OmniMode mode, const char *uri)
                 : now == DL_SCOPE_SITE ? uri_host (uri)
                                        : NULL;
 
+    gtk_check_button_set_label (GTK_CHECK_BUTTON (w->omnialways),
+                                "always replace existing files");
     gtk_check_button_set_active (GTK_CHECK_BUTTON (w->omnialways),
                                  dl_always_for_key (key));
     gtk_widget_set_visible (w->omnialways, TRUE);
@@ -3128,6 +4732,17 @@ omni_show (Win *w, OmniMode mode)
     g_clear_pointer (&w->omni_needle, g_free);
     w->omni_needle = g_strdup ("");
     w->omni_mode   = mode;
+
+    /* The download-directory clash question hides the input and turns the
+     * hint into its question. Whatever way it was left - answered, Esc, a
+     * click outside - the next popup starts from the ordinary layout, and
+     * an unanswered question is dropped rather than answered later. */
+    w->dl_conflict = FALSE;
+    g_clear_pointer (&w->dl_pending_dir, g_free);
+    gtk_widget_set_visible (w->omnientry, TRUE);
+    gtk_label_set_wrap (GTK_LABEL (w->omnihint), FALSE);
+    gtk_widget_set_hexpand (w->omnihint, FALSE);
+    gtk_widget_set_halign (w->omnihint, GTK_ALIGN_END);
 
     w->omni_setting = TRUE;
     gtk_editable_set_text (GTK_EDITABLE (w->omnientry),
@@ -3199,10 +4814,23 @@ omni_go (Win *w)
         return;
     }
 
-    /* the front-end may claim it, e.g. bigbrowser's "diag" */
+    /* the front-end may claim it, e.g. browser-big's "diag" */
     if (g_app->load_uri && g_app->load_uri (w->view, raw)) {
         g_free (raw);
         return;
+    }
+
+    /* Words are a search, not a host. Without this, "tree" became
+     * https://tree and every query needed a keyword in front of it. */
+    if (!looks_like_address (raw)) {
+        char *found = search_default_uri (raw);
+        if (found) {
+            LOG ("search: %s\n", found);
+            webkit_web_view_load_uri (w->view, found);
+            g_free (found);
+            g_free (raw);
+            return;
+        }
     }
 
     char *uri = normalize_uri (raw);
@@ -3220,6 +4848,17 @@ omni_go (Win *w)
 #define FIND_OPTS (WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | \
                    WEBKIT_FIND_OPTIONS_WRAP_AROUND)
 
+/*
+ * How many matches WebKit is asked to find. Past this it stops walking
+ * the document, which is what keeps a one-letter search on a page of
+ * thousands of lines from freezing the browser. Nobody reads past a
+ * thousand highlights anyway; the hint says "1000+".
+ */
+#define FIND_MAX    1000
+#define FIND_DEBOUNCE_MS 120
+
+static guint g_find_timer;
+
 /* WebKit scrolls the hit into view for us. */
 /* The sheet is only worth injecting while the find bar is up. */
 static void
@@ -3232,20 +4871,37 @@ find_highlight (gboolean on)
     css_apply_all ();
 }
 
-static void
-find_run (Win *w)
+static gboolean
+find_run_now (gpointer u)
 {
+    Win *w = u;
+    g_find_timer = 0;
+
+    if (w->omni_mode != OMNI_FIND)
+        return G_SOURCE_REMOVE;
+
     WebKitFindController *fc = webkit_web_view_get_find_controller (w->view);
     const char           *s  = w->omni_needle ? w->omni_needle : "";
 
     if (!*s) {
         webkit_find_controller_search_finish (fc);
         gtk_label_set_text (GTK_LABEL (w->omnihint), "");
-        return;
+        return G_SOURCE_REMOVE;
     }
 
-    webkit_find_controller_count_matches (fc, s, FIND_OPTS, G_MAXUINT);
-    webkit_find_controller_search (fc, s, FIND_OPTS, G_MAXUINT);
+    /* one pass: search() reports the count through found-text itself */
+    webkit_find_controller_search (fc, s, FIND_OPTS, FIND_MAX);
+    return G_SOURCE_REMOVE;
+}
+
+/* Typing is bursty; searching on the pause after it is what a browser
+ * does, and on a large page it is the difference between usable and not. */
+static void
+find_run (Win *w)
+{
+    if (g_find_timer)
+        g_source_remove (g_find_timer);
+    g_find_timer = g_timeout_add (FIND_DEBOUNCE_MS, find_run_now, w);
 }
 
 static void
@@ -3270,7 +4926,9 @@ on_found_count (WebKitFindController *fc, guint count, gpointer u)
     if (!w || w->omni_mode != OMNI_FIND)
         return;
 
-    char *s = count ? g_strdup_printf ("%u", count) : g_strdup ("no match");
+    char *s = count >= FIND_MAX ? g_strdup_printf ("%u+", FIND_MAX)
+            : count             ? g_strdup_printf ("%u", count)
+            :                     g_strdup ("no match");
     gtk_label_set_text (GTK_LABEL (w->omnihint), s);
     g_free (s);
 }
@@ -3290,6 +4948,7 @@ omni_apply_search (Win *w)
 {
     char *line = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (w->omnientry))));
     char *sp   = strchr (line, ' ');
+    gboolean as_default = gtk_check_button_get_active (GTK_CHECK_BUTTON (w->omnialways));
 
     if (!sp || sp == line) {
         toast_show (w, "want: KEY URL, with {} where the words go", URL_TOAST_SECONDS);
@@ -3306,10 +4965,11 @@ omni_apply_search (Win *w)
         return;
     }
 
-    search_set (line, url);
+    search_set (line, url, as_default);
     omni_hide (w);
 
-    char *msg = g_strdup_printf ("search  %s  %s", line, url);
+    char *msg = g_strdup_printf ("search  %s  %s%s", line, url,
+                                 as_default ? "  (default)" : "");
     toast_show (w, msg, URL_TOAST_SECONDS);
 
     g_free (msg);
@@ -3379,7 +5039,10 @@ omni_apply_dldir (Win *w)
                   : g_strdup_printf ("%u rules already go there.  Enter drops them,  Esc keeps all.", users->len);
 
         gtk_label_set_text (GTK_LABEL (w->omnihint), ask);
-        gtk_widget_set_halign (w->omnihint, GTK_ALIGN_START);
+        gtk_label_set_wrap (GTK_LABEL (w->omnihint), TRUE);
+        gtk_label_set_xalign (GTK_LABEL (w->omnihint), 0.0);
+        gtk_widget_set_hexpand (w->omnihint, TRUE);
+        gtk_widget_set_halign (w->omnihint, GTK_ALIGN_FILL);
         gtk_widget_set_visible (w->omnihint, TRUE);
         gtk_widget_set_visible (w->omnientry, FALSE);
         gtk_widget_set_visible (w->omniscope, FALSE);
@@ -3481,9 +5144,10 @@ on_omni_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer u)
 
     omni_reflect (w, row);
 
-    /* in the directory popup a click chooses the directory; Save still
-     * has to be pressed, since the scope has to be right too */
-    if (w->omni_mode != OMNI_DLDIR)
+    /* Only the address and history lists navigate. In the settings popups
+     * a click picks a value to edit - loading a search template as if it
+     * were an address is never what was meant. */
+    if (w->omni_mode == OMNI_URL || w->omni_mode == OMNI_HISTORY)
         omni_go (w);
 }
 
@@ -3498,9 +5162,25 @@ toast_timeout (gpointer u)
     return G_SOURCE_REMOVE;
 }
 
+/* An ordinary message: one line, elided in the middle if it runs long. */
+static void
+toast_single_line (Win *w)
+{
+    GtkLabel *l = GTK_LABEL (w->toast);
+
+    gtk_widget_remove_css_class (w->toast, "br-toast-url");
+    gtk_widget_remove_css_class (w->toast, "br-toast-error");
+    w->error_until_us = 0;
+    gtk_label_set_wrap (l, FALSE);
+    gtk_label_set_lines (l, -1);
+    gtk_label_set_ellipsize (l, PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars (l, 90);
+}
+
 void
 toast_show (Win *w, const char *text, guint seconds)
 {
+    toast_single_line (w);
     gtk_label_set_text (GTK_LABEL (w->toast), text);
     gtk_widget_set_visible (w->toast, TRUE);
 
@@ -3508,6 +5188,83 @@ toast_show (Win *w, const char *text, guint seconds)
         g_source_remove (w->toast_id);
     w->toast_id = g_timeout_add_seconds (seconds, toast_timeout, w);
 }
+
+/*
+ * Something the user asked for did not happen. A message that is cut in
+ * the middle, gone in four seconds or faded under the pointer is no
+ * message at all, so this one is wrapped whole, in the failure colour,
+ * stays up for ERROR_TOAST_SECONDS, does not fade, and always goes to
+ * stderr as well - -q or not.
+ */
+#define ERROR_TOAST_SECONDS 10
+
+void
+toast_error (Win *w, const char *text)
+{
+    g_printerr ("error: %s\n", text);
+    if (!w)
+        return;
+
+    GtkLabel *l = GTK_LABEL (w->toast);
+
+    toast_single_line (w);
+    gtk_widget_add_css_class (w->toast, "br-toast-error");
+    gtk_label_set_ellipsize (l, PANGO_ELLIPSIZE_NONE);
+    gtk_label_set_wrap (l, TRUE);
+    gtk_label_set_wrap_mode (l, PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars (l, 60);
+    gtk_label_set_xalign (l, 0.0);
+    gtk_label_set_text (l, text);
+    gtk_widget_set_opacity (w->topright, 1.0);
+    gtk_widget_set_visible (w->toast, TRUE);
+    w->error_until_us = g_get_monotonic_time () + (gint64) ERROR_TOAST_SECONDS * G_USEC_PER_SEC;
+
+    if (w->toast_id)
+        g_source_remove (w->toast_id);
+    w->toast_id = g_timeout_add_seconds (ERROR_TOAST_SECONDS, toast_timeout, w);
+}
+/*
+ * <mod>+P: the whole address. It is wrapped at any character, in the mono
+ * font, and as wide as the window allows, so nothing is cut out. Only a
+ * monster longer than URL_LINES lines loses its middle. It stays up longer
+ * the longer it is, and the key again puts it away.
+ */
+#define URL_LINES 12
+
+static void
+toast_show_url (Win *w, const char *uri)
+{
+    GtkLabel *l = GTK_LABEL (w->toast);
+
+    if (gtk_widget_get_visible (w->toast) &&
+        gtk_widget_has_css_class (w->toast, "br-toast-url")) {
+        if (w->toast_id)
+            g_source_remove (w->toast_id);
+        toast_timeout (w);
+        return;
+    }
+
+    if (!uri || !*uri) {
+        toast_show (w, "(no url)", URL_TOAST_SECONDS);
+        return;
+    }
+
+    gtk_widget_add_css_class (w->toast, "br-toast-url");
+    gtk_label_set_wrap (l, TRUE);
+    gtk_label_set_wrap_mode (l, PANGO_WRAP_CHAR);
+    gtk_label_set_lines (l, URL_LINES);
+    gtk_label_set_ellipsize (l, PANGO_ELLIPSIZE_MIDDLE);
+    gtk_label_set_max_width_chars (l, 160);
+    gtk_label_set_xalign (l, 0.0);
+    gtk_label_set_text (l, uri);
+    gtk_widget_set_visible (w->toast, TRUE);
+
+    guint secs = CLAMP (URL_TOAST_SECONDS + strlen (uri) / 60, URL_TOAST_SECONDS, 15);
+    if (w->toast_id)
+        g_source_remove (w->toast_id);
+    w->toast_id = g_timeout_add_seconds (secs, toast_timeout, w);
+}
+
 /* ---------------------------------------------------------------- zoom */
 
 static void
@@ -3845,26 +5602,37 @@ downloads_toggle_history (Win *w)
 /* The overlay sits over the page, so fade it out while the pointer is on
  * top of it - there may be something underneath worth reading. It is not
  * click-targetable either, so this only affects what you see. */
+/* A panel you cannot click is in the way if the pointer is over it, so it
+ * gets out of the way. Anything interactive keeps its opacity. */
 static void
-overlay_hover_update (Win *w, double x, double y)
+fade_if_under (Win *w, GtkWidget *panel, double x, double y, gboolean keep)
 {
     graphene_rect_t  bounds;
     graphene_point_t point = GRAPHENE_POINT_INIT ((float) x, (float) y);
     double           want  = 1.0;
 
-    if (gtk_widget_compute_bounds (w->topright, w->win, &bounds)) {
+    if (!keep && gtk_widget_compute_bounds (panel, w->win, &bounds)) {
         graphene_rect_inset (&bounds, -8.0f, -8.0f);      /* a little margin */
         if (bounds.size.width > 1 && graphene_rect_contains_point (&bounds, &point))
             want = 0.0;
     }
 
-    /* a download that just appeared wins over the fade */
-    if (want == 0.0 && w->dl_reveal_us &&
-        g_get_monotonic_time () - w->dl_reveal_us < (gint64) DL_REVEAL_MS * 1000)
-        want = 1.0;
+    if (gtk_widget_get_opacity (panel) != want)
+        gtk_widget_set_opacity (panel, want);
+}
 
-    if (gtk_widget_get_opacity (w->topright) != want)
-        gtk_widget_set_opacity (w->topright, want);
+static void
+overlay_hover_update (Win *w, double x, double y)
+{
+    /* a download that just arrived outranks the fade for a few seconds */
+    gboolean keep_dl = w->dl_reveal_us &&
+                       g_get_monotonic_time () - w->dl_reveal_us
+                       < (gint64) DL_REVEAL_MS * 1000;
+
+    gboolean keep_err = w->error_until_us && g_get_monotonic_time () < w->error_until_us;
+
+    fade_if_under (w, w->topright, x, y, keep_dl || keep_err);
+    fade_if_under (w, w->urltoast, x, y, FALSE);
 }
 
 static void
@@ -3878,7 +5646,10 @@ static void
 on_motion_leave (GtkEventControllerMotion *c, gpointer u)
 {
     (void) c;
-    gtk_widget_set_opacity (((Win *) u)->topright, 1.0);
+    Win *w = u;
+
+    gtk_widget_set_opacity (w->topright, 1.0);
+    gtk_widget_set_opacity (w->urltoast, 1.0);
 }
 
 /* ------------------------------------------------------------- windows */
@@ -3983,6 +5754,18 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
         return TRUE;
     }
 
+    /* the permission prompt owns Enter and Esc while it is up */
+    if (gtk_widget_get_visible (w->perm)) {
+        if (keyval == GDK_KEY_Escape) {
+            perm_answer (w, FALSE);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            perm_answer (w, TRUE);
+            return TRUE;
+        }
+    }
+
     if (keyval == GDK_KEY_Escape) {
         if (close_popups (w))
             return TRUE;
@@ -4071,12 +5854,20 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
         keys_toggle (w);
         return TRUE;
     }
+    if (keyval == GDK_KEY_F2) {
+        media_mode_toggle (w);
+        return TRUE;
+    }
     if (keyval == GDK_KEY_F12) {
         inspector_toggle (w->view);
         return TRUE;
     }
     if (keyval == GDK_KEY_F5) {
         webkit_web_view_reload (w->view);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_F6) {
+        view_kick (w);
         return TRUE;
     }
 
@@ -4155,11 +5946,9 @@ on_key (GtkEventControllerKey *c, guint keyval, guint code,
         downloads_toggle_history (w);
         return TRUE;
 
-    case GDK_KEY_p: {
-        const char *uri = webkit_web_view_get_uri (w->view);
-        toast_show (w, uri ? uri : "(no url)", URL_TOAST_SECONDS);
+    case GDK_KEY_p:
+        toast_show_url (w, webkit_web_view_get_uri (w->view));
         return TRUE;
-    }
 
     case GDK_KEY_y:
         clipboard_copy (w, webkit_web_view_get_uri (w->view));
@@ -4249,6 +6038,7 @@ static const KeyRow g_keyrows[] = {
     { "F12 / %s+Shift+I", "developer tools" },
     { "%s+Shift+R",   "re-read the --css file, then reload" },
     { "F1 / %s+/",    "this list" },
+    { "F2",           "media mode: video to the player, image to the viewer" },
 };
 
 static void
@@ -4409,6 +6199,9 @@ win_free (gpointer data)
         g_source_remove (w->urltoast_id);
     g_free (w->omni_needle);
     g_free (w->dl_pending_dir);
+    g_free (w->hover_link);
+    g_free (w->hover_image);
+    g_free (w->hover_media);
 
     g_free (w);
 }
@@ -4459,6 +6252,103 @@ on_middle_press (GtkGestureClick *g, int n, double x, double y, gpointer u)
     gtk_gesture_set_state (GTK_GESTURE (g), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
+/* --- media mode: F2, the frame, and the click that goes outside ---------- */
+
+static void
+media_mode_set (gboolean on)
+{
+    g_media_mode = on;
+    for (guint i = 0; g_wins && i < g_wins->len; i++) {
+        Win *x = g_ptr_array_index (g_wins, i);
+        if (x->mediaframe)
+            gtk_widget_set_visible (x->mediaframe, on);
+    }
+}
+
+static void
+media_mode_toggle (Win *w)
+{
+    if ((!g_player || !*g_player) && (!g_image_viewer || !*g_image_viewer)) {
+        char *cfg = g_build_filename (g_get_user_config_dir (), g_app->default_app_id,
+                                      "config", NULL);
+        char *msg = g_strdup_printf ("F2 media mode: no player or image viewer is set.\n"
+                                     "Add to %s:\n"
+                                     "    player = mpv\n"
+                                     "    image_viewer = imv\n"
+                                     "or start with --player mpv", cfg);
+        toast_error (w, msg);
+        g_free (msg);
+        g_free (cfg);
+        return;
+    }
+
+    media_mode_set (!g_media_mode);
+
+    char *msg;
+    if (!g_media_mode)
+        msg = g_strdup ("media mode off");
+    else
+        msg = g_strdup_printf ("media mode: %s+click  video -> %s   image -> %s",
+                               g_mod_name,
+                               g_player && *g_player ? g_player : "(none)",
+                               g_image_viewer && *g_image_viewer ? g_image_viewer : "(none)");
+    toast_show (w, msg, URL_TOAST_SECONDS);
+    LOG ("media: mode %s\n", g_media_mode ? "on" : "off");
+    g_free (msg);
+}
+
+static void
+on_mouse_target (WebKitWebView *view, WebKitHitTestResult *hit, guint mods, gpointer u)
+{
+    (void) view; (void) mods;
+    Win *w = u;
+
+    g_clear_pointer (&w->hover_link,  g_free);
+    g_clear_pointer (&w->hover_image, g_free);
+    g_clear_pointer (&w->hover_media, g_free);
+
+    if (webkit_hit_test_result_context_is_link (hit))
+        w->hover_link = g_strdup (webkit_hit_test_result_get_link_uri (hit));
+    if (webkit_hit_test_result_context_is_image (hit))
+        w->hover_image = g_strdup (webkit_hit_test_result_get_image_uri (hit));
+    if (webkit_hit_test_result_context_is_media (hit))
+        w->hover_media = g_strdup (webkit_hit_test_result_get_media_uri (hit));
+}
+
+/*
+ * The <mod>+click itself, taken before the page sees it. What is under the
+ * pointer decides: a link to a video or an image goes by its address, a
+ * link to anything else leaves the image inside it to the viewer, a bare
+ * image goes to the viewer, a <video> with a real address to the player.
+ * Nothing that fits: the click is the page's, as usual.
+ */
+static void
+on_media_press (GtkGestureClick *g, int n, double x, double y, gpointer u)
+{
+    Win *w = u;
+
+    if (!g_media_mode || n != 1)
+        return;
+    GdkModifierType st = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (g));
+    if (!(st & g_mod))
+        return;
+
+    GtkWidget *hit = gtk_widget_pick (w->win, x, y, GTK_PICK_DEFAULT);
+    if (!hit || (hit != GTK_WIDGET (w->view) && !gtk_widget_is_ancestor (hit, GTK_WIDGET (w->view))))
+        return;                           /* on one of our panels */
+
+    gboolean done = FALSE;
+    if (w->hover_link && (is_image_uri (w->hover_link) || is_video_uri (w->hover_link)))
+        done = media_link (w, w->hover_link);
+    if (!done && w->hover_image)
+        done = image_open (w, w->hover_image);
+    if (!done && !w->hover_link && w->hover_media)
+        done = video_open (w, w->hover_media);
+
+    if (done)
+        gtk_gesture_set_state (GTK_GESTURE (g), GTK_EVENT_SEQUENCE_CLAIMED);
+}
+
 /*
  * Place our overlays ourselves, so they survive a window that is narrower
  * or shorter than they would like: everything is clamped to what the
@@ -4491,35 +6381,28 @@ on_overlay_position (GtkOverlay *ov, GtkWidget *child, GdkRectangle *alloc, gpoi
     Win *w      = u;
     int  W      = gtk_widget_get_width (GTK_WIDGET (ov));
     int  H      = gtk_widget_get_height (GTK_WIDGET (ov));
-    int  margin = (int) g_theme.gap;
+    int  margin = (int) (g_theme.margin * g_theme.ui_scale);
     int  want, min_h, nat_h;
 
     if (W <= 0 || H <= 0)
         return FALSE;
 
-    /* One width for every panel, whatever it holds: the address popup,
-     * the history, the directory popup and the key list are all the same
-     * object as far as the eye is concerned. */
     /*
-     * The bar is a plain box laid out here rather than a GtkProgressBar:
-     * a progress bar with its padding and min-height overridden computed a
-     * negative min width for its inner node, and GTK abandons an
-     * allocation pass that sees one - which left the page itself
-     * unallocated, a zero-sized viewport and a white window.
+     * One rule, so there is nothing to learn:
+     *
+     *   things you type into      top, centred        omni, key list
+     *   things that just tell you top right corner    toast, downloads
+     *   where you are going      bottom left corner   the address label
+     *
+     * The corners that touch an edge stay square, and only the panels you
+     * cannot interact with fade out under the pointer.
      */
-    if (child == w->loadbar) {
-        alloc->x      = 0;
-        alloc->y      = 0;
-        alloc->width  = W;              /* constant, so the page is never
-                                         * re-allocated as the bar fills */
-        alloc->height = MAX (1, (int) (3 * g_theme.ui_scale));
-        return TRUE;
-    }
-
-    if (child == w->omni || child == w->keys)
+    if (child == w->omni || child == w->keys || child == w->perm)
         want = (int) (g_theme.popup_w * g_theme.ui_scale);
     else if (child == w->topright)
         want = (int) (360 * g_theme.ui_scale);
+    else if (child == w->urltoast)
+        want = (int) (g_theme.popup_w * g_theme.ui_scale);
     else
         return FALSE;                   /* not ours, let GTK align it */
 
@@ -4540,12 +6423,17 @@ on_overlay_position (GtkOverlay *ov, GtkWidget *child, GdkRectangle *alloc, gpoi
     if (child == w->topright) {
         alloc->x = W - width;           /* pinned to the top right */
         alloc->y = 0;
-    } else if (child == w->omni) {
-        alloc->x = (W - width) / 2;     /* centered, hanging off the top */
-        alloc->y = 0;
+    } else if (child == w->urltoast) {
+        int nat_w, min_w;
+        gtk_widget_measure (child, GTK_ORIENTATION_HORIZONTAL, -1,
+                            &min_w, &nat_w, NULL, NULL);
+        alloc->width = MIN (nat_w, width);
+        alloc->x     = 0;               /* bottom left, where a browser
+                                         * puts the address it is opening */
+        alloc->y     = H - height;
     } else {
-        alloc->x = (W - width) / 2;     /* centered both ways */
-        alloc->y = (H - height) / 2;
+        alloc->x = (W - width) / 2;     /* centred, hanging off the top */
+        alloc->y = 0;
     }
 
     return TRUE;
@@ -4685,12 +6573,45 @@ window_new (WebKitWebView *view, gboolean primary)
     w->keys = keys_panel_new ();
     gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->keys);
 
-    /* The address of the page being opened, top left. It touches the top
-     * and the left, so only its bottom right corner is rounded. */
+    /* the permission prompt: one line of text, Allow and Deny */
+    w->perm = gtk_box_new (GTK_ORIENTATION_VERTICAL, (int) g_theme.gap);
+    gtk_widget_add_css_class (w->perm, "br-perm");
+    gtk_widget_set_halign (w->perm, GTK_ALIGN_FILL);
+    gtk_widget_set_valign (w->perm, GTK_ALIGN_START);
+    gtk_widget_set_visible (w->perm, FALSE);
+
+    w->permlabel = gtk_label_new ("");
+    gtk_label_set_wrap (GTK_LABEL (w->permlabel), TRUE);
+    gtk_label_set_xalign (GTK_LABEL (w->permlabel), 0.0f);
+    gtk_widget_add_css_class (w->permlabel, "br-perm-text");
+    gtk_box_append (GTK_BOX (w->perm), w->permlabel);
+
+    GtkWidget *permrow  = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, (int) g_theme.gap);
+    GtkWidget *permdeny = gtk_button_new_with_label ("Deny  (Esc)");
+    GtkWidget *permok   = gtk_button_new_with_label ("Allow  (Enter)");
+    gtk_widget_add_css_class (permdeny, "flat");
+    gtk_widget_add_css_class (permdeny, "br-btn");
+    gtk_widget_add_css_class (permok, "flat");
+    gtk_widget_add_css_class (permok, "br-btn");
+    gtk_widget_add_css_class (permok, "br-btn-primary");
+    gtk_widget_set_hexpand (permdeny, TRUE);
+    gtk_widget_set_halign (permdeny, GTK_ALIGN_START);
+    gtk_widget_set_halign (permok, GTK_ALIGN_END);
+    gtk_widget_set_focusable (permdeny, FALSE);
+    gtk_widget_set_focusable (permok, FALSE);
+    g_signal_connect (permdeny, "clicked", G_CALLBACK (on_perm_deny),  w);
+    g_signal_connect (permok,   "clicked", G_CALLBACK (on_perm_allow), w);
+    gtk_box_append (GTK_BOX (permrow), permdeny);
+    gtk_box_append (GTK_BOX (permrow), permok);
+    gtk_box_append (GTK_BOX (w->perm), permrow);
+    gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->perm);
+
+    /* The address of the page being opened, bottom left. It touches the
+     * bottom and the left, so only its top right corner is rounded. */
     w->urltoast = gtk_label_new ("");
     gtk_widget_add_css_class (w->urltoast, "br-urltoast");
-    gtk_widget_set_halign (w->urltoast, GTK_ALIGN_START);
-    gtk_widget_set_valign (w->urltoast, GTK_ALIGN_START);
+    gtk_widget_set_halign (w->urltoast, GTK_ALIGN_FILL);
+    gtk_widget_set_valign (w->urltoast, GTK_ALIGN_FILL);
     gtk_widget_set_can_target (w->urltoast, FALSE);
     gtk_widget_set_visible (w->urltoast, FALSE);
     gtk_label_set_ellipsize (GTK_LABEL (w->urltoast), PANGO_ELLIPSIZE_MIDDLE);
@@ -4731,6 +6652,15 @@ window_new (WebKitWebView *view, gboolean primary)
 
     gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->topright);
 
+    /* media mode: a frame round the whole page, click-through */
+    w->mediaframe = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class (w->mediaframe, "br-media-frame");
+    gtk_widget_set_halign (w->mediaframe, GTK_ALIGN_FILL);
+    gtk_widget_set_valign (w->mediaframe, GTK_ALIGN_FILL);
+    gtk_widget_set_can_target (w->mediaframe, FALSE);
+    gtk_widget_set_visible (w->mediaframe, g_media_mode);
+    gtk_overlay_add_overlay (GTK_OVERLAY (overlay), w->mediaframe);
+
     g_signal_connect (overlay, "get-child-position",
                       G_CALLBACK (on_overlay_position), w);
 
@@ -4753,6 +6683,14 @@ window_new (WebKitWebView *view, gboolean primary)
                                                 GTK_PHASE_CAPTURE);
     g_signal_connect (away, "pressed", G_CALLBACK (on_click_away), w);
     gtk_widget_add_controller (w->win, GTK_EVENT_CONTROLLER (away));
+
+    GtkGesture *mclick = gtk_gesture_click_new ();
+    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (mclick), GDK_BUTTON_PRIMARY);
+    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (mclick),
+                                                GTK_PHASE_CAPTURE);
+    g_signal_connect (mclick, "pressed", G_CALLBACK (on_media_press), w);
+    gtk_widget_add_controller (w->win, GTK_EVENT_CONTROLLER (mclick));
+    g_signal_connect (view, "mouse-target-changed", G_CALLBACK (on_mouse_target), w);
 
     if (g_no_middle_paste) {
         GtkGesture *click = gtk_gesture_click_new ();
@@ -4791,6 +6729,388 @@ on_ready_to_show (WebKitWebView *view, gpointer u)
     gtk_window_present (GTK_WINDOW (window_new (view, FALSE)));
 }
 
+/* ------------------------------------------------ start page background */
+
+/*
+ * The colour picked from the start page's palette. It belongs to the
+ * person rather than to a profile - the same reasoning as the download
+ * rules - so it lives one level up, in
+ *
+ *   ~/.local/share/wkview/start-bg      one line, #rrggbb
+ *
+ * and every profile and both browsers agree about it. start_bg in a
+ * config file is the default until a swatch is clicked; from then on
+ * this file is the answer.
+ */
+static char *
+startbg_path (void)
+{
+    return g_build_filename (g_get_user_data_dir (), PROFILE_DIR_NAME,
+                             STARTBG_FILE, NULL);
+}
+
+static void
+startbg_load (void)
+{
+    char *path = startbg_path ();
+    char *txt  = NULL;
+
+    if (g_file_get_contents (path, &txt, NULL, NULL)) {
+        parse_color (g_strstrip (txt), &g_theme.start_bg);
+        g_free (txt);
+    }
+    g_free (path);
+}
+
+static void
+startbg_save (const char *hex)
+{
+    char *path = startbg_path ();
+    char *dir  = g_path_get_dirname (path);
+    char *line = g_strdup_printf ("%s\n", hex);
+
+    g_mkdir_with_parents (dir, 0700);
+    if (g_file_set_contents (path, line, -1, NULL))
+        LOG ("start page: background %s -> %s\n", hex, path);
+    else
+        g_printerr ("start page: cannot write %s\n", path);
+
+    g_free (line);
+    g_free (dir);
+    g_free (path);
+}
+
+/* The palette on the start page posts the colour it was given. Anything
+ * that is not a colour is dropped rather than written to the file. */
+static void
+on_start_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
+{
+    (void) ucm;
+    (void) u;
+
+    if (!value || !jsc_value_is_string (value))
+        return;
+
+    char *s = jsc_value_to_string (value);
+    Color c;
+
+    if (s && parse_color (s, &c)) {
+        g_theme.start_bg = c;
+        startbg_save (s);
+    }
+    g_free (s);
+}
+
+/* ----------------------------------------------------------- --paths */
+
+/*
+ * Every directory and file either browser can write, with what is
+ * actually on disk right now. The profile and cache directories are
+ * walked rather than guessed: WebKit lays out its own storage in there
+ * (local storage, IndexedDB, service workers, the salts behind
+ * deviceId) and the names have changed between releases, so the honest
+ * answer is whatever is there.
+ */
+
+static goffset
+path_size (const char *path)
+{
+    GStatBuf st;
+
+    if (g_stat (path, &st) != 0)
+        return -1;
+
+    if (!S_ISDIR (st.st_mode))
+        return (goffset) st.st_size;
+
+    GDir *d = g_dir_open (path, 0, NULL);
+    if (!d)
+        return 0;
+
+    goffset total = 0;
+    const char *n;
+    while ((n = g_dir_read_name (d))) {
+        char *child = g_build_filename (path, n, NULL);
+        goffset s = path_size (child);
+        if (s > 0)
+            total += s;
+        g_free (child);
+    }
+    g_dir_close (d);
+    return total;
+}
+
+static char *
+fmt_size (goffset n)
+{
+    if (n < 0)
+        return g_strdup ("-");
+    if (n < 1024)
+        return g_strdup_printf ("%" G_GOFFSET_FORMAT " B", n);
+    if (n < 1024 * 1024)
+        return g_strdup_printf ("%.0f K", n / 1024.0);
+    if (n < 1024 * 1024 * 1024)
+        return g_strdup_printf ("%.1f M", n / (1024.0 * 1024.0));
+    return g_strdup_printf ("%.1f G", n / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void
+path_line (GString *s, const char *path, const char *note)
+{
+    gboolean here = g_file_test (path, G_FILE_TEST_EXISTS);
+    char    *sz   = here ? fmt_size (path_size (path)) : g_strdup ("not yet");
+
+    g_string_append_printf (s, "  %-52s %8s%s%s\n", path, sz,
+                            (note && *note) ? "  " : "", (note && *note) ? note : "");
+    g_free (sz);
+}
+
+/* What we know a name in the profile directory is for. Anything not in
+ * here is WebKit's and is listed as such. */
+static const char *
+data_note (const char *name)
+{
+    if (!strcmp (name, "cookies.sqlite"))   return "cookies - this is your logins";
+    if (!strcmp (name, HIST_FILE))          return "addresses visited";
+    if (!strcmp (name, SEARCH_FILE))        return "search keywords (see below)";
+    if (!strcmp (name, PERM_FILE))          return "camera / microphone answers per site";
+    if (g_str_has_prefix (name, "cookies.sqlite-")) return "sqlite journal";
+    return "WebKit storage";
+}
+
+static void
+walk_into (GString *s, const char *dir, gboolean annotate)
+{
+    GDir *d = g_dir_open (dir, 0, NULL);
+
+    if (!d) {
+        g_string_append (s, "    (not created yet)\n");
+        return;
+    }
+
+    GList *names = NULL;
+    const char *n;
+    while ((n = g_dir_read_name (d)))
+        names = g_list_prepend (names, g_strdup (n));
+    g_dir_close (d);
+    names = g_list_sort (names, (GCompareFunc) g_strcmp0);
+
+    if (!names)
+        g_string_append (s, "    (empty)\n");
+
+    for (GList *l = names; l; l = l->next) {
+        char *child = g_build_filename (dir, l->data, NULL);
+        char *sz    = fmt_size (path_size (child));
+        char *label = g_strconcat (l->data,
+                                   g_file_test (child, G_FILE_TEST_IS_DIR) ? "/" : "",
+                                   NULL);
+        const char *note = annotate ? data_note (l->data) : "";
+
+        g_string_append_printf (s, "    %-49s %8s%s%s\n", label, sz,
+                                *note ? "  " : "", note);
+        g_free (label);
+        g_free (sz);
+        g_free (child);
+    }
+    g_list_free_full (names, g_free);
+}
+
+/* The keywords themselves, the same way: what each one searches and
+ * which one a bare word goes to. */
+static void
+searches_print (GString *s, const char *path)
+{
+    GPtrArray *keys = g_ptr_array_new_with_free_func (g_free);
+    GPtrArray *urls = g_ptr_array_new_with_free_func (g_free);
+    GPtrArray *mine = g_ptr_array_new ();      /* GINT_TO_POINTER: from the file */
+    char      *dflt = NULL;
+    char      *text = NULL;
+
+    if (g_file_get_contents (path, &text, NULL, NULL)) {
+        char **lines = g_strsplit (text, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            char **f = g_strsplit (lines[i], "\t", 3);
+            if (g_strv_length (f) >= 2 && *f[0] && *f[1]) {
+                if (g_strv_length (f) >= 3 && !g_strcmp0 (g_strstrip (f[2]), "default")) {
+                    g_free (dflt);
+                    dflt = g_strdup (f[0]);
+                }
+                g_ptr_array_add (keys, g_strdup (f[0]));
+                g_ptr_array_add (urls, g_strdup (f[1]));
+                g_ptr_array_add (mine, GINT_TO_POINTER (1));
+            }
+            g_strfreev (f);
+        }
+        g_strfreev (lines);
+        g_free (text);
+    }
+
+    for (gsize b = 0; b < G_N_ELEMENTS (SEARCH_BUILTIN); b++) {
+        gboolean have = FALSE;
+        for (guint i = 0; i < keys->len && !have; i++)
+            have = !strcmp (g_ptr_array_index (keys, i), SEARCH_BUILTIN[b][0]);
+        if (have)
+            continue;
+        g_ptr_array_add (keys, g_strdup (SEARCH_BUILTIN[b][0]));
+        g_ptr_array_add (urls, g_strdup (SEARCH_BUILTIN[b][1]));
+        g_ptr_array_add (mine, GINT_TO_POINTER (0));
+    }
+
+    const char *d = dflt ? dflt : SEARCH_BUILTIN_DEFAULT;
+    for (guint i = 0; i < keys->len; i++) {
+        const char *k = g_ptr_array_index (keys, i);
+        g_string_append_printf (s, "      %-6s %s%s%s\n", k,
+                                (char *) g_ptr_array_index (urls, i),
+                                GPOINTER_TO_INT (g_ptr_array_index (mine, i)) ? "" : "   (built in)",
+                                !strcmp (k, d) ? "   <- default" : "");
+    }
+
+    g_free (dflt);
+    g_ptr_array_free (keys, TRUE);
+    g_ptr_array_free (urls, TRUE);
+    g_ptr_array_free (mine, TRUE);
+}
+
+/* The rules themselves, so the file's one job is visible rather than
+ * described: which address or site goes where. */
+static void
+dlrules_print (GString *s, const char *path)
+{
+    char *text = NULL;
+
+    if (!g_file_get_contents (path, &text, NULL, NULL))
+        return;
+
+    char **lines = g_strsplit (text, "\n", -1);
+    int    n     = 0;
+
+    for (int i = 0; lines[i]; i++) {
+        if (!*lines[i])
+            continue;
+
+        char **f = g_strsplit (lines[i], "\t", 3);
+        gboolean always = g_strv_length (f) >= 3 &&
+                          !g_strcmp0 (g_strstrip (f[2]), DL_ALWAYS_TOKEN);
+
+        if (g_strv_length (f) >= 2 && *f[0]) {
+            if (!g_strcmp0 (f[0], DL_ALL_KEY))
+                g_string_append_printf (s, "      %-38s %s\n", "(everything)",
+                                        always ? "always replace existing files"
+                                               : "");
+            else
+                g_string_append_printf (s, "      %-38s -> %s%s\n", f[0], f[1],
+                                        always ? "   (always replace)" : "");
+            n++;
+        }
+        g_strfreev (f);
+    }
+    g_strfreev (lines);
+    g_free (text);
+
+    if (!n)
+        g_string_append (s, "      (no rules yet)\n");
+}
+
+static void
+paths_report (void)
+{
+    GString *s = g_string_new (NULL);
+    char    *cfg_shared = cfg_path_for ("swov");
+    char    *cfg_own    = cfg_path_for (g_app->default_app_id);
+    char    *dlrules    = dlrules_path ();
+    char    *startbg    = startbg_path ();
+    char    *data_dir = NULL, *cache_dir = NULL;
+
+    profile_dirs (g_profile, &data_dir, &cache_dir);
+
+    g_string_append_printf (s, "%s %s (build %s) - everything on disk\n\n",
+                            g_app->default_app_id, BROWSER_VERSION, BROWSER_BUILD);
+
+    g_string_append (s, "settings, read at startup, first file wins per key:\n");
+    path_line (s, cfg_shared, "shared palette (swov)");
+    path_line (s, cfg_own,    "ours, overrides the above");
+    g_string_append (s, "\n");
+
+    if (g_private) {
+        g_string_append (s,
+            "profile: --private, so nothing below is written. Cookies,\n"
+            "logins, history and cache live in memory and go with the\n"
+            "window. No search keywords are loaded either.\n\n");
+    } else {
+        g_string_append_printf (s,
+            "profile \"%s\" - logins live here:\n  %s/\n",
+            g_profile ? g_profile : "default", data_dir);
+        walk_into (s, data_dir, TRUE);
+        g_string_append (s, "\n");
+
+        char *spath = g_build_filename (data_dir, SEARCH_FILE, NULL);
+        g_string_append_printf (s,
+            "search keywords - set with %s+K, one list per profile:\n", g_mod_name);
+        path_line (s, spath, NULL);
+        searches_print (s, spath);
+        g_string_append_printf (s,
+            "  \"g tree\" searches with g; a bare \"tree\" uses the default.\n"
+            "  Another --profile has its own file and its own keywords.\n\n");
+        g_free (spath);
+
+        g_string_append_printf (s, "cache, safe to delete:\n  %s/\n", cache_dir);
+        walk_into (s, cache_dir, FALSE);
+        g_string_append (s, "\n");
+    }
+
+    /* Two separate things, and mixing them up is the easy mistake: where
+     * a file lands, and the file that holds the per-site exceptions. */
+    const char *land = (g_download_dir && *g_download_dir)
+                     ? g_download_dir
+                     : g_get_user_special_dir (G_USER_DIRECTORY_DOWNLOAD);
+
+    g_string_append (s, "downloads:\n");
+    g_string_append_printf (s, "  a file lands in\n    %s%s\n",
+                            land ? land : ".",
+                            (g_download_dir && *g_download_dir)
+                                ? "   (download_dir / --download-dir)"
+                                : "   (the XDG download directory)");
+    g_string_append_printf (s,
+        "  unless a rule for its address or its site says otherwise.\n"
+        "  The rules are all in this one file, written by %s+S:\n", g_mod_name);
+    path_line (s, dlrules, NULL);
+    dlrules_print (s, dlrules);
+    g_string_append (s,
+        "  It is yours, not a profile's: every profile and both browsers\n"
+        "  read and write this same file, and a save merges rather than\n"
+        "  overwrites, so two running browsers do not trample each other.\n"
+        "\n");
+
+    {
+        const char *rt = g_get_user_runtime_dir ();
+        char *md = g_build_filename (rt && *rt ? rt : g_get_tmp_dir (), "wkview-media", NULL);
+        g_string_append (s, "media mode (F2), images fetched for the image viewer:\n");
+        path_line (s, md, "removed after an hour");
+        g_string_append (s, "\n");
+        g_free (md);
+    }
+
+    g_string_append (s, "start page:\n");
+    path_line (s, startbg, "background colour");
+    g_string_append (s, "  Also yours rather than a profile's, and written by the palette\n"
+                        "  on the start page itself.\n");
+
+    g_string_append (s,
+        "\nNothing else is written. --clear-data wipes the profile and cache\n"
+        "directories above, --forget-perms drops " PERM_FILE " alone,\n"
+        "--private skips all of it.\n");
+
+    g_print ("%s", s->str);
+
+    g_free (cfg_shared);
+    g_free (cfg_own);
+    g_free (dlrules);
+    g_free (startbg);
+    g_free (data_dir);
+    g_free (cache_dir);
+    g_string_free (s, TRUE);
+}
+
 /* --------------------------------------------------- user content manager */
 
 /* One manager per view, so a front-end's script-message handler can tell
@@ -4807,6 +7127,11 @@ static WebKitUserContentManager *
 ucm_new (void)
 {
     WebKitUserContentManager *ucm = webkit_user_content_manager_new ();
+
+    /* the start page's colour palette answers here */
+    g_signal_connect (ucm, "script-message-received::wkStart",
+                      G_CALLBACK (on_start_message), NULL);
+    webkit_user_content_manager_register_script_message_handler (ucm, "wkStart", NULL);
 
     if (g_app->ucm_ready)
         g_app->ucm_ready (ucm);
@@ -4825,15 +7150,18 @@ view_wire (WebKitWebView *view)
      * session, not on the web view - it is wired up once in browser_main(). */
     g_signal_connect (view, "decide-policy",      G_CALLBACK (on_decide_policy), NULL);
     g_signal_connect (view, "permission-request", G_CALLBACK (on_permission), NULL);
+    g_signal_connect (view, "query-permission-state", G_CALLBACK (on_query_permission), NULL);
     g_signal_connect (view, "create",             G_CALLBACK (on_create), NULL);
     g_signal_connect (view, "load-changed",       G_CALLBACK (on_load_core), NULL);
     g_signal_connect (view, "load-failed",        G_CALLBACK (on_load_failed_core), NULL);
     g_signal_connect (view, "notify::title",     G_CALLBACK (on_title_toast), NULL);
+    g_signal_connect (view, "web-process-terminated",
+                      G_CALLBACK (on_web_process_gone), NULL);
     g_signal_connect (view, "notify::estimated-load-progress",
                       G_CALLBACK (on_load_progress), NULL);
 
     WebKitFindController *fc = webkit_web_view_get_find_controller (view);
-    g_signal_connect (fc, "counted-matches",     G_CALLBACK (on_found_count), NULL);
+    g_signal_connect (fc, "found-text",          G_CALLBACK (on_found_count), NULL);
     g_signal_connect (fc, "failed-to-find-text", G_CALLBACK (on_found_none), NULL);
 
     if (g_app->view_ready)
@@ -4900,6 +7228,13 @@ setup_session (void)
     }
 
     g_mkdir_with_parents (g_data_dir, 0700);
+
+    if (g_forget_perms) {
+        char *p = g_build_filename (g_data_dir, PERM_FILE, NULL);
+        if (g_unlink (p) == 0)
+            LOG ("permissions: forgotten (%s removed)\n", p);
+        g_free (p);
+    }
     g_mkdir_with_parents (cache_dir, 0700);
 
     g_session = webkit_network_session_new (g_data_dir, cache_dir);
@@ -4929,20 +7264,16 @@ setup_settings (void)
     /* best effort at behaving like a mainstream browser */
     webkit_settings_set_enable_site_specific_quirks (g_settings, TRUE);
 
-    /* Cloudflare/Turnstile sometimes correlates missing GPU features with bots */
-    settings_set_bool_if_exists (g_settings, "enable-webgl", TRUE);
-    settings_set_bool_if_exists (g_settings, "enable-accelerated-2d-canvas", TRUE);
-
-    /* lets a player pick a codec the build actually has, instead of
-     * negotiating one it cannot decode and then stalling */
-    settings_set_bool_if_exists (g_settings, "enable-media-capabilities", TRUE);
 
     if (g_user_agent && *g_user_agent) {
         webkit_settings_set_user_agent (g_settings, g_user_agent);
         LOG ("ua: %s\n", g_user_agent);
     }
 
-    webkit_settings_set_enable_developer_extras                 (g_settings, TRUE);
+    /* the inspector's debugger comes with these even with no inspector
+     * open; a "NeedDebuggerBreak trap" on a plain page is the reason for
+     * --no-devtools */
+    webkit_settings_set_enable_developer_extras                 (g_settings, !g_no_devtools);
     webkit_settings_set_enable_media_stream                     (g_settings, TRUE);
     webkit_settings_set_enable_webrtc                           (g_settings, TRUE);
     webkit_settings_set_enable_mediasource                      (g_settings, TRUE);
@@ -4950,7 +7281,12 @@ setup_settings (void)
     webkit_settings_set_enable_webaudio                         (g_settings, TRUE);
     webkit_settings_set_media_playback_requires_user_gesture    (g_settings, FALSE);
     webkit_settings_set_javascript_can_access_clipboard         (g_settings, TRUE);
-    webkit_settings_set_enable_write_console_messages_to_stdout (g_settings, !g_quiet);
+    /* A chatty page writes these synchronously from the web process, and
+     * to a terminal that is six times dearer than to a file. */
+    webkit_settings_set_enable_write_console_messages_to_stdout (
+        g_settings, !g_quiet && !g_no_console);
+
+    features_apply (g_settings);
 
     if (g_no_gpu) {
         webkit_settings_set_hardware_acceleration_policy (
@@ -4971,18 +7307,58 @@ setup_settings (void)
  * base URI, which makes it about:blank as far as the rest of the code is
  * concerned - so it stays out of the history by itself.
  */
+
+/*
+ * The swatches. Pure white and pure black are both in, at the two ends,
+ * with soft flat tones between them - nothing saturated, since this is a
+ * background and not a subject.
+ */
+static const char *const START_SWATCHES[] = {
+    "#ffffff",   /* pure white */
+    "#f3f0e9",   /* paper, the default */
+    "#ebe4d6",   /* sand */
+    "#e3ebe2",   /* sage */
+    "#e2e9f1",   /* sky */
+    "#e9e4ef",   /* lilac */
+    "#f2e4e4",   /* rose */
+    "#cfd6dd",   /* stone */
+    "#2b3138",   /* slate */
+    "#0d1117",   /* ink, the panel palette */
+    "#000000",   /* pure black */
+};
+
+static char *
+color_hex6 (Color c)
+{
+    return g_strdup_printf ("#%02x%02x%02x",
+                            (int) (c.r * 255 + 0.5),
+                            (int) (c.g * 255 + 0.5),
+                            (int) (c.b * 255 + 0.5));
+}
+
 static char *
 start_page_html (void)
 {
     Theme *t = &g_theme;
 
-    char *c_bg      = css_rgba (t->bg);
-    char *c_tile    = css_rgba (t->tile);
-    char *c_text    = css_rgba (t->text);
-    char *c_dim     = css_rgba (t->dim);
-    char *c_subtext = css_rgba (t->subtext);
-    char *c_hl      = css_rgba (t->hl);
-    char *c_glow    = css_rgba_at (t->hl, 0.22);
+    char *c_bg = color_hex6 (t->start_bg);
+
+    /* Both ends of the palette have to read, so the text colour comes
+     * from the background rather than from the panel palette. */
+    double lum = 0.2126 * t->start_bg.r
+               + 0.7152 * t->start_bg.g
+               + 0.0722 * t->start_bg.b;
+    gboolean light = lum > 0.5;
+
+    const char *c_text = light ? "#16191d" : "#e9ecef";
+    const char *c_sub  = light ? "#5a6470" : "#aab4c0";
+    const char *c_dim  = light ? "#8a939e" : "#6e7a87";
+    /* the panel accent is a mustard: it needs deepening on a light
+     * background and stays as it is on a dark one */
+    char       *c_hl     = css_rgba (t->hl);
+    char       *c_hl_lo  = css_rgba ((Color) { t->hl.r * 0.72, t->hl.g * 0.62,
+                                               t->hl.b * 0.30, 1.0 });
+    const char *c_line = light ? "rgba(0,0,0,.14)" : "rgba(255,255,255,.16)";
 
     /* "browser-mini" reads better as browser + mini */
     const char *name = g_app->default_app_id;
@@ -4990,45 +7366,86 @@ start_page_html (void)
     char       *head = dash ? g_strndup (name, (gsize) (dash - name)) : g_strdup (name);
     const char *tail = dash ? dash + 1 : NULL;
 
+    GString *sw = g_string_new (NULL);
+    for (gsize i = 0; i < G_N_ELEMENTS (START_SWATCHES); i++)
+        g_string_append_printf (sw, "<i data-c=\"%s\" style=\"background:%s\"></i>",
+                                START_SWATCHES[i], START_SWATCHES[i]);
+
     char *html = g_strdup_printf (
 "<!doctype html><meta charset=\"utf-8\"><title>%s</title><style>"
+":root{--bg:%s;--fg:%s;--sub:%s;--dim:%s;--line:%s;--hl:%s}"
 "html,body{margin:0}"
 "body{min-height:100vh;box-sizing:border-box;padding:8vh 2rem;"
 "display:flex;align-items:center;justify-content:center;"
-"background:radial-gradient(circle at 50%% 38%%,%s 0%%,%s 72%%);"
-"font-family:%s,sans-serif;color:%s;"
-"-webkit-font-smoothing:antialiased}"
+"background:var(--bg);font-family:%s,sans-serif;color:var(--fg);"
+"transition:background .18s ease;-webkit-font-smoothing:antialiased}"
 ".c{text-align:center;transform:translateY(-5vh)}"
-"h1{margin:0;font-size:11vmin;font-weight:200;letter-spacing:.18em;"
-"color:%s;text-shadow:0 0 60px %s}"
-"h1 b{color:%s;font-weight:600}"
+"h1{margin:0;font-size:11vmin;font-weight:200;letter-spacing:.18em;color:var(--fg)}"
+"h1 b{color:var(--hl);font-weight:600}"
 ".r{width:9em;height:2px;margin:1.1em auto 1.4em;"
-"background:linear-gradient(90deg,transparent,%s,transparent)}"
-".v{font-family:%s,monospace;font-size:.85rem;color:%s;letter-spacing:.1em}"
-".k{margin-top:2.6em;font-family:%s,monospace;font-size:.95rem;color:%s}"
-".k b{color:%s;font-weight:600}"
+"background:linear-gradient(90deg,transparent,var(--line),transparent)}"
+".v{font-family:%s,monospace;font-size:.85rem;color:var(--dim);letter-spacing:.1em}"
+".k{margin-top:2.6em;font-family:%s,monospace;font-size:.95rem;color:var(--sub)}"
+".k b{color:var(--hl);font-weight:600}"
+/* the palette, top centre */
+"#p{position:fixed;top:0;left:0;right:0;display:flex;flex-direction:column;"
+"align-items:center;gap:.5rem;padding:.9rem 1rem;user-select:none}"
+"#t{width:14px;height:14px;padding:0;border-radius:50%%;cursor:pointer;"
+"border:1px solid var(--line);background:var(--fg);opacity:.22;"
+"transition:opacity .18s ease}"
+"#t:hover,#p.on #t{opacity:.6}"
+"#s{display:flex;gap:.45rem;opacity:0;pointer-events:none;"
+"transform:translateY(-4px);transition:opacity .18s ease,transform .18s ease}"
+"#p.on #s{opacity:1;pointer-events:auto;transform:none}"
+"#s i{width:20px;height:20px;border-radius:50%%;cursor:pointer;"
+"box-shadow:inset 0 0 0 1px rgba(128,128,128,.45);"
+"transition:transform .12s ease}"
+"#s i:hover{transform:scale(1.25)}"
+"#s i.on{box-shadow:inset 0 0 0 1px rgba(128,128,128,.45),0 0 0 2px var(--fg)}"
 "</style>"
+"<div id=p><button id=t title=\"background colour\"></button><div id=s>%s</div></div>"
 "<div class=c><h1>%s%s<b>%s</b></h1><div class=r></div>"
 "<div class=v>%s &middot; build %s</div>"
 "<div class=k><b>%s+O</b> address &nbsp;&nbsp; <b>%s+H</b> history"
-" &nbsp;&nbsp; <b>F1</b> keys</div></div>",
+" &nbsp;&nbsp; <b>F1</b> keys</div></div>"
+"<script>"
+"var p=document.getElementById('p'),s=document.getElementById('s'),"
+"r=document.documentElement;"
+"document.getElementById('t').onclick=function(){p.classList.toggle('on')};"
+"function lum(h){return(0.2126*parseInt(h.substr(1,2),16)"
+"+0.7152*parseInt(h.substr(3,2),16)+0.0722*parseInt(h.substr(5,2),16))/255}"
+"function mark(h){var a=s.children;for(var i=0;i<a.length;i++)"
+"a[i].classList.toggle('on',a[i].dataset.c===h)}"
+"function put(h,save){var L=lum(h)>0.5;"
+"r.style.setProperty('--bg',h);"
+"r.style.setProperty('--fg',L?'#16191d':'#e9ecef');"
+"r.style.setProperty('--sub',L?'#5a6470':'#aab4c0');"
+"r.style.setProperty('--dim',L?'#8a939e':'#6e7a87');"
+"r.style.setProperty('--line',L?'rgba(0,0,0,.14)':'rgba(255,255,255,.16)');"
+"r.style.setProperty('--hl',L?'%s':'%s');"
+"mark(h);"
+"if(save){try{webkit.messageHandlers.wkStart.postMessage(h)}catch(e){}}}"
+"s.onclick=function(e){var h=e.target.dataset&&e.target.dataset.c;"
+"if(h)put(h,true)};"
+"mark('%s');"
+"</script>",
         name,
-        c_tile, c_bg,
-        *t->font ? t->font : "system-ui", c_text,
-        c_text, c_glow,
-        c_hl,
-        c_hl,
-        t->font_mono, c_dim,
-        t->font_mono, c_subtext,
-        c_hl,
+        c_bg, c_text, c_sub, c_dim, c_line, light ? c_hl_lo : c_hl,
+        *t->font ? t->font : "system-ui",
+        t->font_mono,
+        t->font_mono,
+        sw->str,
         head, tail ? " " : "", tail ? tail : "",
         BROWSER_VERSION, BROWSER_BUILD,
-        g_mod_name, g_mod_name);
+        g_mod_name, g_mod_name,
+        c_hl_lo, c_hl,
+        c_bg);
 
+    g_string_free (sw, TRUE);
     g_free (head);
-    g_free (c_bg);   g_free (c_tile); g_free (c_text);
-    g_free (c_dim);  g_free (c_subtext);
-    g_free (c_hl);   g_free (c_glow);
+    g_free (c_bg);
+    g_free (c_hl);
+    g_free (c_hl_lo);
     return html;
 }
 
@@ -5045,23 +7462,6 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     g_app = app;
     theme_defaults ();
 
-    /*
-     * Help and version are answered before anything else is looked at, so
-     * they cannot be lost behind a mistyped option earlier on the line, a
-     * config file, or a front-end that exits while parsing its own flags.
-     */
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp (argv[i], "-h") || !strcmp (argv[i], "--help")) {
-            usage (argv[0], TRUE);
-            return 0;
-        }
-        if (!strcmp (argv[i], "-V") || !strcmp (argv[i], "--version")) {
-            g_print ("%s %s (build %s)\n", app->default_app_id,
-                     BROWSER_VERSION, BROWSER_BUILD);
-            return 0;
-        }
-    }
-
     /* config first, so anything on the command line still wins */
     for (int i = 1; i < argc; i++) {
         if ((!strcmp (argv[i], "-c") || !strcmp (argv[i], "--config")) && i + 1 < argc)
@@ -5075,6 +7475,56 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             cfg_load_file (cfg_path);
         else
             cfg_load_default_chain (app->default_app_id);
+    }
+
+    /* the colour last picked from the start page's palette outranks the
+     * start_bg key, because it is the more recent thing the person said */
+    startbg_load ();
+
+    /* answered here, like -h, so it needs no display and no config */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp (argv[i], "--list-features"))
+            continue;
+
+        const char *filter = (i + 1 < argc && argv[i + 1][0] != '-')
+                           ? argv[i + 1] : NULL;
+        features_list (filter);
+        return 0;
+    }
+
+    /*
+     * Answered after the config is read, so the paths and values printed
+     * are the ones that would actually be used, but before the main loop,
+     * so they cannot be lost behind a mistyped option later on the line
+     * or a front-end that exits while parsing its own flags.
+     */
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp (argv[i], "-h") || !strcmp (argv[i], "--help")) {
+            usage (argv[0], TRUE);
+            return 0;
+        }
+        if (!strcmp (argv[i], "-V") || !strcmp (argv[i], "--version")) {
+            g_print ("%s %s (build %s)\n", app->default_app_id,
+                     BROWSER_VERSION, BROWSER_BUILD);
+            return 0;
+        }
+        if (!strcmp (argv[i], "--paths")) {
+            /* --profile and --private decide what the answer is, and they
+             * are parsed further down, so read them here: --paths works
+             * wherever it sits on the line. */
+            for (int j = 1; j < argc; j++) {
+                if (!strcmp (argv[j], "--private"))
+                    g_private = TRUE;
+                else if (!strcmp (argv[j], "--profile") && j + 1 < argc) {
+                    g_free (g_profile);
+                    g_profile = g_strdup (argv[++j]);
+                }
+                else if (!strcmp (argv[j], "--mod") && j + 1 < argc)
+                    parse_mod (argv[++j]);      /* the report names a key */
+            }
+            paths_report ();
+            return 0;
+        }
     }
 
 #define NEED_ARG(opt) \
@@ -5123,6 +7573,18 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             NEED_ARG ("--clip-cmd");
             g_free (g_clip_cmd);
             g_clip_cmd = g_strdup (argv[++i]);
+        } else if (!strcmp (a, "--player")) {
+            NEED_ARG ("--player");
+            cfg_set ("player", argv[++i]);
+            g_media_mode = TRUE;          /* asked for on the line: start in it */
+        } else if (!strcmp (a, "--image-viewer")) {
+            NEED_ARG ("--image-viewer");
+            cfg_set ("image_viewer", argv[++i]);
+        } else if (!strcmp (a, "--media")) {
+            g_media_mode = TRUE;
+        } else if (!strcmp (a, "--player-match")) {
+            NEED_ARG ("--player-match");
+            cfg_set ("player_match", argv[++i]);
         } else if (!strcmp (a, "--zoom")) {
             NEED_ARG ("--zoom");
             g_zoom = CLAMP (g_ascii_strtod (argv[++i], NULL), ZOOM_MIN, ZOOM_MAX);
@@ -5131,10 +7593,49 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             g_css_path = argv[++i];
         } else if (!strcmp (a, "--devtools")) {
             open_devtools = TRUE;
-        } else if (!strcmp (a, "--no-media")) {
-            g_deny_media = TRUE;
+        } else if (!strcmp (a, "--forget-permissions")) {
+            g_forget_perms = TRUE;
+        } else if (!strcmp (a, "--allow-media")) {
+            g_media_policy = MEDIA_ALLOW;
+        } else if (!strcmp (a, "--deny-media") || !strcmp (a, "--no-media")) {
+            g_media_policy = MEDIA_DENY;
+            g_deny_media   = TRUE;
         } else if (!strcmp (a, "--no-load-bar")) {
             g_load_bar = FALSE;
+        } else if (!strcmp (a, "--no-sandbox")) {
+            g_no_sandbox = TRUE;
+        } else if (!strcmp (a, "--list-features")) {
+            g_list_features = (i + 1 < argc && argv[i + 1][0] != '-')
+                            ? argv[++i] : "\001";
+        } else if (!strcmp (a, "--shared-array-buffer")) {
+            g_shared_ab = TRUE;
+        } else if (!strcmp (a, "--no-shared-array-buffer")) {
+            g_shared_ab = FALSE;
+        } else if (!strcmp (a, "--jsc")) {
+            NEED_ARG ("--jsc");
+            if (!g_jsc_opts)
+                g_jsc_opts = g_ptr_array_new_with_free_func (g_free);
+            g_ptr_array_add (g_jsc_opts, g_strdup (argv[++i]));
+        } else if (!strcmp (a, "--gl-info")) {
+            g_gl_info = TRUE;
+        } else if (!strcmp (a, "--feature")) {
+            NEED_ARG ("--feature");
+            if (!g_features)
+                g_features = g_ptr_array_new_with_free_func (g_free);
+            g_ptr_array_add (g_features, g_strdup (argv[++i]));
+        } else if (!strcmp (a, "--gsk")) {
+            NEED_ARG ("--gsk");
+            g_gsk_renderer = argv[++i];
+        } else if (!strcmp (a, "--no-proc-watch")) {
+            g_proc_watch = FALSE;
+        } else if (!strcmp (a, "--no-console")) {
+            g_no_console = TRUE;
+        } else if (!strcmp (a, "--all-messages")) {
+            g_all_messages = TRUE;
+        } else if (!strcmp (a, "--no-devtools")) {
+            g_no_devtools = TRUE;
+        } else if (!strcmp (a, "--no-jit")) {
+            g_no_jit = TRUE;
         } else if (!strcmp (a, "--no-gpu")) {
             g_no_gpu = TRUE;
         } else if (!strcmp (a, "--no-dmabuf")) {
@@ -5222,12 +7723,79 @@ browser_main (int argc, char **argv, const BrowserApp *app)
 
     /* Must be set before any process is spawned, so the web and GPU
      * processes inherit them. */
+    /*
+     * GL by default. GTK 4.20 picks Vulkan where the driver claims support,
+     * and a Vulkan stack that deadlocks recreating its swapchain freezes
+     * the whole browser on a resize. GL is GTK's fallback everywhere, and
+     * WebKit composites the page itself, so nothing is given up. "auto"
+     * leaves the choice to GTK.
+     */
+    if (g_gsk_renderer && g_ascii_strcasecmp (g_gsk_renderer, "auto") != 0) {
+        g_setenv ("GSK_RENDERER", g_gsk_renderer, TRUE);
+        LOG ("gsk: renderer = %s\n", g_gsk_renderer);
+    }
+
+    if (g_no_sandbox) {
+        /* The sandboxed web process reaches capture devices through the
+         * desktop portal. Without a portal there are none, and this is the
+         * way round it - at the cost of the sandbox, so it says so. */
+        g_setenv ("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", TRUE);
+        g_printerr ("sandbox: DISABLED for this run (--no-sandbox)\n");
+    }
+
+    /*
+     * JavaScriptCore reads its own options from the environment, and they
+     * have to be set before the web process starts. SharedArrayBuffer is
+     * off by default here: a site using threaded WebAssembly needs it and
+     * hangs without it rather than reporting anything.
+     */
+    if (g_shared_ab)
+        g_setenv ("JSC_useSharedArrayBuffer", "1", TRUE);
+
+    if (g_jsc_opts) {
+        for (guint k = 0; k < g_jsc_opts->len; k++) {
+            char *spec = g_ptr_array_index (g_jsc_opts, k);
+            char *eq   = strchr (spec, '=');
+            char *name = g_strconcat ("JSC_", spec, NULL);
+
+            if (eq) {
+                name[4 + (eq - spec)] = '\0';
+                g_setenv (name, eq + 1, TRUE);
+                LOG ("jsc: %s = %s\n", name, eq + 1);
+            } else {
+                g_setenv (name, "1", TRUE);
+                LOG ("jsc: %s = 1\n", name);
+            }
+            g_free (name);
+        }
+    }
+
+    if (g_no_jit) {
+        /* JavaScriptCore reads these itself; they have to be in the
+         * environment before the web process is spawned. */
+        g_setenv ("JSC_useJIT", "0", TRUE);
+        g_setenv ("JSC_useBaselineJIT", "0", TRUE);
+        g_setenv ("JSC_useDFGJIT", "0", TRUE);
+        g_setenv ("JSC_useFTLJIT", "0", TRUE);
+    }
     if (g_no_dmabuf)      g_setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     if (g_no_compositing) g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
-    if (g_no_hw_decode)   g_setenv ("WEBKIT_GST_ENABLE_HW_DECODERS", "0", TRUE);
+    /* WebKitGTK 2.54 has no switch of its own for this (the old
+     * WEBKIT_GST_ENABLE_HW_DECODERS is gone). GStreamer's documented way
+     * is the feature rank: a decoder at NONE is never autoplugged. */
+    if (g_no_hw_decode)
+        gst_rank_env_add ("vah264dec:NONE,vah265dec:NONE,vavp8dec:NONE,vavp9dec:NONE,"
+                          "vaav1dec:NONE,vampeg2dec:NONE,vajpegdec:NONE,"
+                          "vaapih264dec:NONE,vaapih265dec:NONE,vaapivp8dec:NONE,"
+                          "vaapivp9dec:NONE,vaapiav1dec:NONE,vaapidecodebin:NONE,"
+                          "v4l2slh264dec:NONE,v4l2slh265dec:NONE,v4l2slvp8dec:NONE,"
+                          "v4l2slvp9dec:NONE,v4l2slav1dec:NONE,v4l2h264dec:NONE,"
+                          "v4l2h265dec:NONE,v4l2vp8dec:NONE,v4l2vp9dec:NONE");
 
     if (app->pre_gtk)
         app->pre_gtk ();
+
+    noise_filter_start ();
 
     /* line-buffer, so our log interleaves sensibly with the web process
      * writing to the same stderr */
@@ -5250,7 +7818,6 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     setup_session ();
     g_signal_connect (g_session, "download-started",
                       G_CALLBACK (on_session_download_started), NULL);
-    object_set_string_if_exists (G_OBJECT (g_session), "downloads-directory", g_download_dir);
 
     history_setup (g_data_dir);
     dlrules_setup (g_data_dir);      /* app wide; the profile is only migrated from */
@@ -5264,8 +7831,23 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     if (open_devtools)
         g_signal_connect (view, "load-changed", G_CALLBACK (on_load_changed_devtools), NULL);
 
+    if (g_gl_info) {
+        gl_info ();
+        return 0;
+    }
+
     GtkWidget *win  = window_new (view, TRUE);
     GMainLoop *loop = g_main_loop_new (NULL, FALSE);
+
+    g_loop = loop;
+    frame_watch_attach (win);
+    if (g_proc_watch) {
+        g_timeout_add_seconds (5, proc_watch_tick, NULL);
+        g_timeout_add (500, heartbeat_tick, NULL);
+        g_thread_unref (g_thread_new ("ui-watch", ui_watch_thread, NULL));
+    }
+    g_unix_signal_add (SIGINT,  on_quit_signal, NULL);
+    g_unix_signal_add (SIGTERM, on_quit_signal, NULL);
     g_object_set_data (G_OBJECT (win), "loop", loop);
 
     /* No address given: the start page, rather than an empty window. */
@@ -5275,7 +7857,7 @@ browser_main (int argc, char **argv, const BrowserApp *app)
         g_free (html);
         gtk_window_present (GTK_WINDOW (win));
     } else {
-        /* the front-end may claim the address, e.g. bigbrowser's "diag" */
+        /* the front-end may claim the address, e.g. browser-big's "diag" */
         if (!(app->load_uri && app->load_uri (view, url_arg))) {
             char *url = normalize_uri (url_arg);
             if (!url) {
@@ -5293,6 +7875,8 @@ browser_main (int argc, char **argv, const BrowserApp *app)
 
     if (app->cleanup)
         app->cleanup ();
+
+    noise_summary ();
 
     g_main_loop_unref (loop);
     g_free (g_css_data);

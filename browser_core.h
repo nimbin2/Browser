@@ -49,6 +49,10 @@ typedef struct {
     double         load_frac;
     guint          urltoast_id;
     GtkWidget     *keys;        /* key reference, hidden by default         */
+    GtkWidget     *perm;        /* "this site wants your camera" prompt     */
+    GtkWidget     *permlabel;
+    GPtrArray     *permqueue;   /* requests waiting on the prompt's answer  */
+    char          *permhost;
     GtkWidget     *topright;    /* box holding the toast and the downloads */
     GtkWidget     *toast;       /* GtkLabel, hidden by default            */
     GtkWidget     *dlpanel;     /* download overlay, rebuilt on refresh   */
@@ -57,6 +61,7 @@ typedef struct {
     guint          dl_history_id;
     gboolean       primary;
     gint64         dl_reveal_us;  /* a download just appeared; do not fade   */
+    gint64         error_until_us; /* an error toast is up; do not fade      */
 
     /* stored-history walk, see history.c section in browser_core.c */
     gboolean       hist_walk;    /* past the end of the session list       */
@@ -76,6 +81,13 @@ typedef struct {
     gboolean       dl_conflict;
     char          *dl_pending_dir;
     int            dl_pending_scope;
+
+    /* media mode: the frame that says it is on, and what is under the
+     * pointer, so a <mod>+click on an image can go to the image viewer */
+    GtkWidget     *mediaframe;
+    char          *hover_link;   /* link address under the pointer, or NULL */
+    char          *hover_image;  /* image address under the pointer, or NULL */
+    char          *hover_media;  /* <video>/<audio> source, or NULL         */
 
     gpointer       ext;          /* front-end state, see BrowserApp.win_* */
 } Win;
@@ -119,6 +131,10 @@ typedef struct {
      * the key was ours. */
     gboolean (*cfg_set)       (const char *key, const char *value);
 
+    /* A page asked for a camera or microphone and was allowed it. Lets a
+     * front-end notice that nothing ever started capturing. */
+    void     (*media_asked)   (gboolean audio, gboolean video);
+
     void     (*cleanup)       (void);
 } BrowserApp;
 
@@ -153,10 +169,11 @@ extern const char     *g_mod_name;
 
 Win  *win_of    (WebKitWebView *view);
 void  toast_show (Win *w, const char *text, guint seconds);
+void  toast_error (Win *w, const char *text);   /* red, wrapped, 10 s, also stderr */
 void  css_reload (void);
 void  view_eval  (WebKitWebView *view, const char *js);
 char *normalize_uri (const char *in);
-void  settings_set_bool_if_exists (WebKitSettings *s, const char *prop, gboolean value);
-void  object_set_string_if_exists (GObject *o, const char *prop, const char *value);
+void  gst_rank_env_add (const char *spec);   /* append to GST_PLUGIN_FEATURE_RANK */
+void  feature_request  (const char *spec);   /* --feature NAME[=on|off], from a front-end */
 
 #endif /* BROWSER_CORE_H */
