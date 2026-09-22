@@ -3,10 +3,7 @@
 Two WebKitGTK 6.0 (GTK4) page viewers sharing one core.
 
 **100% Vibecode but tested** — built warning-free with `-Wall -Wextra` against
-the WebKitGTK 2.54.0 and 2.52.6 headers, linked and run headless under Xvfb
-on 2.52.6. Every WebKit call, signal and property was checked against the
-2.54.0 sources (`Source/WebKit/UIProcess/API/glib`) and the GStreamer 1.28
-sources; what they contradicted was removed.
+GTK 4.14 / WebKitGTK 2.52.3, and run headless under Xvfb.
 
 ## Layout
 
@@ -107,10 +104,8 @@ web_compat = yes
 
 `--jsc NAME=VALUE` sets any other JavaScriptCore option the same way
 (`--jsc useJIT=0`, and so on). Measured: `sharedArrayBuffer` in the
-`rtc-caps` line goes from `false` to `true`. With the option on,
-JavaScriptCore exposes the constructor to every page, isolated or not
-(`JSGlobalObject.cpp`); `rtc-caps` still reports `crossOriginIsolated`
-because some libraries check it themselves.
+`rtc-caps` line goes from `false` to `true`. The page must also be
+cross-origin isolated, which `rtc-caps` reports separately.
 
 ## Isolating a freeze that happens after a call connects
 
@@ -140,14 +135,11 @@ The audio track here reports `sampleRate: 0`, which is not a valid rate;
 a library that sizes its buffers from it can spin. `--no-mic` is the test
 for that.
 
-## APIs WebKitGTK has but keeps off
+## APIs WebKitGTK does not implement
 
-`screen.orientation` is implemented, but the `ScreenOrientationAPI` runtime
-feature defaults to off on GTK (`WebPreferencesDefaultValues.cpp`), so
-Zoom's media code reads `screen.orientation.type` and throws. `--web-compat`
-turns the real feature on and, only if a page still sees nothing, supplies a
-static object. `--feature ScreenOrientationAPI` on its own does the first
-half.
+`--web-compat` supplies them. Currently `screen.orientation`: Zoom's media
+code reads `screen.orientation.type` and throws before it starts, even
+though its WebRTC negotiation completes fine.
 
 ## A site that will not accept the stream
 
@@ -163,11 +155,6 @@ it starts, and both are repaired in the offer rather than in the site:
 | `--rtc-trace` | reports every WebRTC step — connection made, tracks attached, offer created, answer set. The last event logged is the step that failed. Included in `--media-trace` |
 | `--sdp-ssrc-fix` | adds the `a=ssrc:<n> cname:<v>` lines WebKit leaves out. A site parsing the offer for the CNAME throws `CNAME value not found` and never connects |
 | `--video-codecs VP8` | sets the sending codec order. WebKit may offer something this machine has no encoder for — `--media-debug` lists the encoders you have |
-| `--ice-libnice` | give webrtcbin its stock libnice ICE agent in the web process. Since 2.52 WebKit hands it its own **librice** agent whose sockets, STUN, TURN and DNS lookups live in the network process (`GStreamerMediaEndpoint.cpp`, `RiceBackend.cpp`); 2.54 reworked that backend and it still carries FIXMEs (TURN allocations are UDP only, only the first DNS answer is used, the UDP port range is ignored). This is the switch between the two implementations; `ice = libnice` in the config |
-
-`--ice-libnice` is the first thing to try when `pc1` works, the call
-connects on the LAN, and it does not connect over the internet: everything
-else is the same and only the ICE implementation changes.
 
 The user agent comes first: a publisher library picks its code path from
 it, and WebKitGTK's own string may get no path at all — in which case no
@@ -414,7 +401,7 @@ the whole cost.
 ## Version
 
 ```
-browser-mini --version     # browser-mini 4.19.0 (build …)
+browser-mini --version     # browser-mini 4.18.0 (build 4bbf154)
 make version
 ```
 
@@ -709,9 +696,8 @@ Everything a conferencing site has needed so far, as settled preferences:
 ```
 # ~/.config/browser-big/config
 audio = alsa                     # plain-ALSA machine, no sound server
-web_compat = yes                 # ScreenOrientationAPI on, for Zoom's media engine
+web_compat = yes                 # screen.orientation for Zoom's media engine
 feature = OffscreenCanvas=off    # no worker-side WebGL attempt, so no CPU fallback
-# ice = libnice                  # if calls connect on the LAN but not over the internet
 ```
 
 Two things that used to be here are now the default, because they are safe
@@ -733,11 +719,10 @@ they got. Each rung adds one layer, so the first one that fails names it.
 | Page | Tests | Flags to try if it fails |
 | --- | --- | --- |
 | `src/content/getusermedia/gum/` | camera only, no audio, no WebRTC | `--rtc-trace` to see it |
-| `src/content/getusermedia/audio/` | microphone only | `--prewarm` to see the providers |
+| `src/content/getusermedia/audio/` | microphone only | `--audio-alsa` |
 | `src/content/getusermedia/resolution/` | asks for QVGA, VGA, HD by size, some `exact` | `--cam-scale` |
 | `src/content/getusermedia/record/` | MediaRecorder from the camera | — |
-| `src/content/peerconnection/pc1/` | **a full WebRTC call inside one page**, no server, no ICE servers | `--video-codecs VP8` |
-| any real call to another machine | STUN, TURN, DNS — the part `pc1` never exercises | `--ice-libnice`, `--rtc-trace` |
+| `src/content/peerconnection/pc1/` | **a full WebRTC call inside one page**, no server | `--fix-webrtc`, `--video-codecs VP8` |
 | `src/content/peerconnection/constraints/` | codec and bitrate negotiation | `--video-codecs` |
 
 `pc1` is the important one: two peer connections in one page, offer,
@@ -755,12 +740,9 @@ browser-big https://webrtc.github.io/samples/src/content/peerconnection/pc1/ --r
 A page asking for the camera or microphone is **asked about**, the way a
 browser does: a panel at the top names the site and what it wants, `Enter`
 allows, `Esc` denies, and the answer is remembered per site in
-`<profile>/permissions.tsv`. WebKit 2.54 no longer asks about device labels
-with a separate request: before `enumerateDevices()` and `getUserMedia()`
-it emits `query-permission-state` for `camera` and `microphone`, and an
-unanswered query counts as *prompt*. Both browsers answer it from the same
-remembered file, so a site that was allowed once gets its labels, and
-`navigator.permissions.query()` tells the page the truth.
+`<profile>/permissions.tsv`. Device labels for `enumerateDevices()` are
+revealed only once a site has been granted a device, which is also what
+other browsers do.
 
 ```
 --forget-permissions forget every remembered answer, so sites ask again
@@ -774,31 +756,61 @@ policy, and it is gone.
 
 ## When the camera is not picked up
 
-WebKit 2.54 finds cameras the way `gst-device-monitor-1.0 Video/Source`
-does: with GStreamer's device monitor, which on a plain Linux box means
-`v4l2deviceprovider` from gst-plugins-good and readable `/dev/video*`
-nodes. The desktop portal is asked only when a PipeWire ≥ 0.3.64 device
-provider is installed (`PipeWireCaptureDeviceManager.cpp`); without one the
-portal, D-Bus and the machine id play no part. Microphones come from
-`alsadeviceprovider` or `pulsedeviceprovider` the same way.
+browser-big probes the capture devices itself with GStreamer and logs what
+it found. If that count is non-zero but the page still says access was
+denied, the devices are fine — the web process could not reach them. It
+gets at them through the desktop portal, and the portal needs a working
+D-Bus.
 
-So the checks are:
+The usual cause is a missing machine id, which makes D-Bus unable to start
+at all:
+
+A machine id is a D-Bus requirement, not a systemd one. Either tool works,
+and neither needs an init system:
 
 ```
-browser-big --list-cameras                 # what the device monitor sees
-gst-device-monitor-1.0 Video/Source        # the same, from GStreamer itself
-gst-inspect-1.0 v4l2deviceprovider alsadeviceprovider
-ls -l /dev/video*  ;  id                   # readable? group video?
+sudo dbus-uuidgen --ensure=/etc/machine-id       # any distro with dbus
+sudo ln -sf /etc/machine-id /var/lib/dbus/machine-id
 ```
 
-A bubblewrap-sandboxed build (`ENABLE_BUBBLEWRAP_SANDBOX`) binds
-`/dev/video*` into the sandbox by itself (`BubblewrapLauncher.cpp`);
-`--no-sandbox` (`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`) is for the
-case where that still fails. browser-big reports which it got:
+Without dbus's tools at all, the file is just 32 hex characters:
+
+```
+head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | sudo tee /etc/machine-id
+```
+
+Then a session bus. With no systemd user session, start one per run, or
+better, start the compositor inside one so every app shares it:
+
+```
+dbus-run-session -- browser-big URL      # per run
+dbus-run-session -- sway                 # whole session
+```
+
+The portal itself is a separate package: `xdg-desktop-portal` plus a
+backend — `xdg-desktop-portal-wlr` for sway, or `-gtk`.
+
+browser-big checks the result rather than trusting the flag. A sandboxed
+web process is placed in its own mount namespace by `bwrap`, so it compares
+namespaces and says which it is:
 
 ```
 sandbox: web process 312, parent bwrap, mount namespace differs from ours  ->  sandboxed
 sandbox: web process 370, parent browser-big, mount namespace same as ours  ->  NOT sandboxed
+```
+
+Portal warnings can keep appearing either way — WebKit asks the portal for
+settings and other things too, so they are not evidence of sandboxing.
+
+Or skip the portal entirely. `--no-sandbox` lets the web process open the
+capture devices directly, which is the pragmatic answer on a machine with
+no portal at all. It gives up the sandbox and prints a line saying so on
+every run.
+
+To rule the sandbox out instead:
+
+```
+WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1 browser-big URL
 ```
 
 `--media-trace` logs every `getUserMedia` call, the constraints it asked
@@ -832,16 +844,14 @@ pactl info                    # is a Pulse server running, and did it get the ca
 If ALSA has a capture device but GStreamer lists none, a half-working Pulse
 server is usually in the way.
 
-`--audio-alsa` ranks `pulsesink` out, so `autoaudiosink` — which is what
-WebKit plays through — picks `alsasink`. That fixes browser audio on a
-machine whose Pulse server came up with a dummy sink.
+`--audio-alsa` ranks the pulse *elements* out, so playback and recording go
+through ALSA. That fixes browser audio on a machine whose Pulse server came
+up with a dummy sink.
 
-It does **not** change capture. WebKit opens the microphone the device
-monitor found (`gst_device_create_element`, `GStreamerCapturer.cpp`), so
-source element ranks never come into it, and `GST_PLUGIN_FEATURE_RANK` is
-applied to element factories only — `gstpluginfeature.c` looks the name up
-as `GST_TYPE_ELEMENT_FACTORY`, so a device provider entry is silently
-ignored. A microphone therefore needs `alsadeviceprovider`:
+It does **not** change enumeration. `GST_PLUGIN_FEATURE_RANK` is honoured
+for elements but silently ignored for device providers — measured, not
+assumed — so which devices exist is still decided by the providers that are
+installed. A microphone therefore needs `alsadeviceprovider`:
 
 ```
 gst-inspect-1.0 alsadeviceprovider     # part of gst-plugins-base's alsa plugin
@@ -849,9 +859,7 @@ gst-device-monitor-1.0 Audio/Source    # what WebKit will see
 ```
 
 `--prewarm` reports whether that provider is present. `--gst-rank SPEC`
-appends to the variable by hand. GStreamer 1.28 starts device providers
-asynchronously; `--list-cameras` and `--prewarm` wait for the monitor's
-*started* message (up to 5 s) the way WebKit does, so the list is complete.
+sets the variable by hand.
 
 To have it every run, put it in browser-big's config rather than typing the
 flag:
@@ -947,23 +955,16 @@ gstreamer: these are missing, and pages will fail without them:
 ```
 
 WebRTC needs more than one plugin, which is why "install gst-plugins-bad"
-often isn't enough. The list is what `gstwebrtcbin.c` (1.28) and WebKit's
-`GStreamerMediaEndpoint.cpp` look up by name:
+often isn't enough:
 
 | Element | From | Needs |
 | --- | --- | --- |
 | `webrtcbin` | gst-plugins-bad | **libnice** at build time |
-| `nicesrc` / `nicesink` | libnice's own GStreamer plugin | webrtcbin refuses to leave NULL without them — **also with WebKit's librice agent** |
-| `dtlsenc` / `dtlsdec`, `dtlssrtpenc` / `dtlssrtpdec` | gst-plugins-bad | OpenSSL |
-| `srtpenc` / `srtpdec` | gst-plugins-bad | libsrtp2 |
-| `sctpenc` / `sctpdec` | gst-plugins-bad | data channels; most conferencing sites open one |
-| `rtpbin`, `rtpfunnel`, `rtp*pay` / `rtp*depay` | gst-plugins-good | — |
-| `opusenc` / `opusdec` | gst-plugins-base | libopus |
-| `vp8enc` / `vp8dec` | gst-plugins-good | libvpx |
-| `x264enc`, `openh264enc` **or** `vah264enc` | -ugly / -bad / -bad (VA-API) | H.264 **encoding**; the three WebKit's own encoder wraps |
-| `avdec_h264` **or** `vah264dec` | gst-libav / -bad | H.264 decoding |
-| `videoconvert`, `videoscale`, `videorate`, `decodebin3` | gst-plugins-base | the capture pipeline (`GStreamerVideoCapturer.cpp`) |
-| `jpegdec` | gst-plugins-good | an MJPEG camera, through `decodebin3` |
+| `x264enc` **or** `openh264enc` | gst-plugins-ugly / -bad | H.264 **encoding**, for publishing |
+| `nicesrc` / `nicesink` | libnice itself | built with GStreamer support |
+| `srtpenc` | gst-plugins-bad | libsrtp2 |
+| `dtlssrtpenc` | gst-plugins-bad | OpenSSL |
+| `rtpbin` | gst-plugins-good | — |
 
 Two more come from `gst-plugins-rs` — `audiornnoise` (noise suppression)
 and `rtpgccbwe` (RTP bandwidth estimation). Neither is required; WebKit
@@ -1010,8 +1011,7 @@ empty" directly. `Ctrl+Shift+M` opens the built-in diagnostics page.
 | `--cam-share` | hand a repeated request the stream already open, nothing else |
 | `--cam-fix` | relax tight constraints, retry looser, hold the stream |
 | `--fix-media` | `--cam-fix` plus prewarm, media watchdog and auto-reload |
-| `--audio-alsa` | play through ALSA rather than PulseAudio |
-| `--ice-libnice` | the stock libnice ICE agent instead of WebKit's librice one |
+| `--audio-alsa` | play and record through ALSA rather than PulseAudio |
 | `--no-sandbox` | let the web process reach devices without the portal |
 | `--no-gpu`, `--no-dmabuf`, `--no-compositing`, `--no-jit` | rendering and JIT fallbacks |
 
@@ -1109,11 +1109,8 @@ browser-mini URL --no-compositing
 browser-mini URL --no-gpu
 ```
 
-`--no-hw-decode` is the same idea for video: WebKitGTK 2.54 has no switch
-of its own any more, so it ranks the VA-API, VAAPI and V4L2 decoders to
-`NONE` through `GST_PLUGIN_FEATURE_RANK`, which WebKit's registry scanner
-honours (it lists decoders from `GST_RANK_MARGINAL` up). Any of them can go
-in a config file once you know which one it was.
+`--no-hw-decode` is the same idea for video. Any of them can go in a config
+file once you know which one it was.
 
 ## Options worth knowing
 
@@ -1137,7 +1134,6 @@ One rule, so there is nothing to learn:
 | --- | --- |
 | things you type into | top, centred — the popup and the key list |
 | things that just tell you something | top right — messages and downloads |
-| something you asked for that failed | top right in `urgent` red, whole and wrapped, 10 s, not faded by the pointer, and on stderr |
 | where you are going | bottom left — the address being opened |
 
 Corners touching an edge stay square. Panels you can't interact with fade

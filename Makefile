@@ -2,7 +2,7 @@ CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -rdynamic
 PREFIX  ?= /usr
 
-VERSION  := 4.19.1
+VERSION  := 4.18.0
 SOURCES  := browser_core.c browser_core.h browser-mini.c browser-big.c Makefile
 BUILD_ID := $(shell cat $(SOURCES) 2>/dev/null | md5sum | cut -c1-7)
 

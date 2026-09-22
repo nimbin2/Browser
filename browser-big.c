@@ -43,6 +43,14 @@ static guint    g_capture_watch;
 
 /* camera / media behaviour */
 static gboolean g_cam_fix;                 /* install the getUserMedia shim */
+/*
+ * The shim carries more than camera repairs: --rtc-trace, --web-compat,
+ * --no-mic and the offer fixes all ride in it. Installing it must not
+ * change how the camera behaves, so the repairs below - relaxing,
+ * retrying, dropping audio, and above all cloning and holding the capture
+ * track - only apply when one of the camera flags asked for them.
+ */
+static gboolean g_cam_repair;              /* --cam-fix, --cam-share, ... */
 static gboolean g_cam_relax     = TRUE;    /* loosen the page's constraints */
 static gboolean g_cam_keepalive = TRUE;    /* reuse and hold the capture stream */
 static gboolean g_cam_drop_audio = TRUE;   /* video-only rather than nothing */
@@ -52,6 +60,7 @@ static int      g_cam_max_h     = 720;
 static int      g_cam_max_fps   = 30;
 static int      g_cam_force_w, g_cam_force_h, g_cam_force_fps;
 static gboolean g_cam_force_exact;
+static gboolean g_no_mic;                  /* --no-mic diagnostic */
 static gboolean g_web_compat;              /* fill in APIs WebKit lacks */
 static gboolean g_cam_scale;
 static int      g_cam_scale_fps = 15;      /* ceiling for the scaled output */               /* give the page the size it asked */
@@ -79,7 +88,26 @@ static gboolean g_first_load_done;
 /* rendering / debugging switches that only touch the environment */
 static gboolean    g_no_webrtc, g_no_mediastream;
 static const char *g_gst_debug, *g_gst_dbgfile, *g_webkit_dbg;
-static const char *g_gst_rank;             /* GST_PLUGIN_FEATURE_RANK */
+static char       *g_gst_rank;             /* GST_PLUGIN_FEATURE_RANK, accumulated */
+
+static void
+gst_rank_add (const char *spec)
+{
+    if (!g_gst_rank) {
+        g_gst_rank = g_strdup (spec);
+        return;
+    }
+    char *joined = g_strconcat (g_gst_rank, ",", spec, NULL);
+    g_free (g_gst_rank);
+    g_gst_rank = joined;
+}
+
+/* every VA-API element GStreamer offers, so none of them gets picked */
+#define VA_RANK_OFF \
+    "vah264enc:NONE,vah264lpenc:NONE,vah265enc:NONE,vah265lpenc:NONE," \
+    "vavp9enc:NONE,vaav1enc:NONE,vah264dec:NONE,vah265dec:NONE," \
+    "vavp8dec:NONE,vavp9dec:NONE,vaav1dec:NONE,vajpegdec:NONE," \
+    "vapostproc:NONE,vadeinterlace:NONE,vacompositor:NONE"
 static int         g_gst_level = -1;
 
 /* Per-window watchdog bookkeeping, hung off Win.ext. */
@@ -271,6 +299,16 @@ static const char *SHIM_JS =
 "  return o;"
 "}"
 /* --cam-force: the size and shape are ours, whatever the page asked. */
+/* --no-mic: the page gets no microphone, whatever it asked. A diagnostic:
+ * if a freeze disappears, the audio path is the cause. */
+"function withoutMic(c){"
+"  if(!C.noMic||!c||!c.audio)return c;"
+"  var o={},k;for(k in c)o[k]=c[k];"
+"  o.audio=false;"
+"  if(!o.video){post({ev:'gum-nomic-refused'});return c;}"
+"  post({ev:'gum-nomic'});"
+"  return o;"
+"}"
 "function withForce(c){"
 "  if(!C.forceW||!c||!c.video)return c;"
 "  var o={},k;for(k in c)o[k]=c[k];"
@@ -472,7 +510,7 @@ static const char *SHIM_JS =
 "    if(!levels.length)levels=[start];"
 "    var i=0,audioDropped=false;"
 "    function attempt(){"
-"      var cc=withForce(withPin(relax(c,levels[i])));"
+"      var cc=withoutMic(withForce(withPin(relax(c,levels[i]))));"
 "      post({ev:'gum-try',level:levels[i],constraints:safe(cc)});"
 "      return origGUM(cc).then(function(st){"
 "        post({ev:'gum-ok',ms:Math.round(now()-t0),level:levels[i]});"
@@ -768,7 +806,7 @@ static const char *SHIM_JS =
 "window.__bbHeld=function(){"
 "  return !!(cachedV&&cachedV.readyState==='live')||!!(cachedA&&cachedA.readyState==='live');"
 "};"
-"post({ev:'shim',camfix:true,url:location.href});"
+"post({ev:'shim',camfix:true,repair:!!(C.cache||C.relax||C.retries),url:location.href});"
 "})();";
 
 /* Dumps the state of every media element; used by <mod>+Shift+V. */
@@ -1013,6 +1051,29 @@ dump_gstreamer_env (void)
     dump_env ("WEBKIT_GST_ENABLE_HW_DECODERS");
     dump_env ("WEBKIT_DISABLE_DMABUF_RENDERER");
     dump_env ("WEBKIT_DISABLE_COMPOSITING_MODE");
+
+    /*
+     * Whether GStreamer can report anything at all. Built with
+     * -Dgst-debug=disabled these are compile-time constants, GST_DEBUG is
+     * ignored, GST_DEBUG_FILE is never even created - and every attempt
+     * to diagnose a media problem returns nothing, which looks like the
+     * problem being silent rather than the tooling being absent.
+     */
+    /*
+     * Two different things, easily confused: whether the debug system was
+     * compiled in at all (a macro in gstconfig.h), and whether a level is
+     * currently set (gst_debug_is_active(), which is false whenever
+     * GST_DEBUG is unset, even in a build that supports it).
+     */
+#ifdef GST_DISABLE_GST_DEBUG
+    mlog ("gst-debug: COMPILED OUT of this GStreamer - GST_DEBUG can never\n"
+          "gst-debug: report anything. Rebuild gstreamer core with its\n"
+          "gst-debug: gst_debug option on.");
+#else
+    mlog ("gst-debug: supported; currently %s (threshold %d)",
+          gst_debug_is_active () ? "ON" : "off, set GST_DEBUG to use it",
+          (int) gst_debug_get_default_threshold ());
+#endif
 
     mlog ("---- capture / WebRTC element check ----");
     static const char *els[] = {
@@ -1335,7 +1396,7 @@ on_script_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
         ev_is (s, "params-fix-on") || ev_is (s, "sdp-ssrc-verify") ||
         ev_is (s, "cam-scaled")    || ev_is (s, "cam-scale-error") ||
         ev_is (s, "cam-scale-skip")|| ev_is (s, "compat-orientation") ||
-        ev_is (s, "cam-scale-mode")||
+        ev_is (s, "cam-scale-mode")|| ev_is (s, "gum-nomic") ||
         ev_is (s, "compat-error")  ||
         ev_is (s, "media-stall")|| ev_is (s, "media-reload") ||
         ev_is (s, "media-dump") || ev_is (s, "warm-ok") ||
@@ -1473,13 +1534,13 @@ build_shim (void)
         "window.__bbCfg={camfix:%s,relax:%s,cache:%s,dropAudio:%s,retries:%d,"
         "maxW:%d,maxH:%d,maxFps:%d,forceW:%d,forceH:%d,forceFps:%d,holdMs:%d,"
         "forceExact:%s,ssrcFix:%s,codecs:%s,rtcTrace:%s,paramsFix:%s,scale:%s,"
-        "compat:%s,scaleFps:%d,"
+        "compat:%s,scaleFps:%d,noMic:%s,"
         "match:%s,watchdog:%s,stall:%d,debug:%s};",
         g_cam_fix        ? "true" : "false",
-        g_cam_relax      ? "true" : "false",
-        g_cam_keepalive  ? "true" : "false",
-        g_cam_drop_audio ? "true" : "false",
-        g_cam_retries,
+        (g_cam_repair && g_cam_relax)      ? "true" : "false",
+        (g_cam_repair && g_cam_keepalive)  ? "true" : "false",
+        (g_cam_repair && g_cam_drop_audio) ? "true" : "false",
+        g_cam_repair ? g_cam_retries : 0,
         g_cam_max_w, g_cam_max_h, g_cam_max_fps,
         g_cam_force_w, g_cam_force_h, g_cam_force_fps, g_cam_hold_ms,
         g_cam_force_exact ? "true" : "false",
@@ -1490,6 +1551,7 @@ build_shim (void)
         g_cam_scale       ? "true" : "false",
         g_web_compat      ? "true" : "false",
         g_cam_scale_fps,
+        g_no_mic          ? "true" : "false",
         match,
         g_media_watchdog ? "true" : "false",
         g_stall_timeout,
@@ -1610,6 +1672,82 @@ big_media_asked (gboolean audio, gboolean video)
     g_capture_watch   = g_timeout_add_seconds (5, capture_check, NULL);
 }
 
+/*
+ * Where is the web process? When a page freezes and the log shows nothing,
+ * the answer is in what its threads are doing: a thread in D state is
+ * blocked in the kernel (a device write, a pipe), and wchan names the
+ * function it is waiting in. Needs no gdb and no privileges.
+ */
+static void
+threads_dump (void)
+{
+    GDir       *d    = g_dir_open ("/proc", 0, NULL);
+    pid_t       self = getpid ();
+    GHashTable *parent = g_hash_table_new (g_direct_hash, g_direct_equal);
+    const char *name;
+    guint       shown = 0;
+
+    if (!d)
+        return;
+
+    /* first pass: parent map, so only our own web processes count */
+    GPtrArray *webs = g_ptr_array_new ();
+    while ((name = g_dir_read_name (d))) {
+        if (!g_ascii_isdigit (name[0])) continue;
+        pid_t pid = atoi (name), ppid = 0; char comm[64];
+        if (!proc_ppid_comm (pid, &ppid, comm, sizeof comm)) continue;
+        g_hash_table_insert (parent, GINT_TO_POINTER (pid), GINT_TO_POINTER (ppid));
+        if (strstr (comm, "WebKitWebProc") || strstr (comm, "WebKitGPUProc"))
+            g_ptr_array_add (webs, GINT_TO_POINTER (pid));
+    }
+    g_dir_close (d);
+
+    for (guint i = 0; i < webs->len; i++) {
+        pid_t pid = GPOINTER_TO_INT (g_ptr_array_index (webs, i));
+        if (!is_descendant (parent, pid, self))
+            continue;
+
+        char *tdir = g_strdup_printf ("/proc/%d/task", (int) pid);
+        GDir *td   = g_dir_open (tdir, 0, NULL);
+        mlog ("threads: process %d", (int) pid);
+        mlog ("threads:   %-6s %-2s %-18s %s", "tid", "st", "name", "waiting in");
+
+        const char *tn;
+        while (td && (tn = g_dir_read_name (td))) {
+            char *p, *comm = NULL, *wchan = NULL, *stat = NULL;
+            char  state = '?';
+
+            p = g_strdup_printf ("%s/%s/comm", tdir, tn);
+            g_file_get_contents (p, &comm, NULL, NULL); g_free (p);
+            p = g_strdup_printf ("%s/%s/wchan", tdir, tn);
+            g_file_get_contents (p, &wchan, NULL, NULL); g_free (p);
+            p = g_strdup_printf ("%s/%s/stat", tdir, tn);
+            if (g_file_get_contents (p, &stat, NULL, NULL)) {
+                char *rp = strrchr (stat, ')');      /* comm may hold spaces */
+                if (rp && rp[1] == ' ' && rp[2]) state = rp[2];
+            }
+            g_free (p);
+
+            if (comm)  g_strchomp (comm);
+            if (wchan) g_strchomp (wchan);
+
+            /* R running, S sleeping, D blocked in the kernel */
+            mlog ("threads:   %-6s %-2c %-18s %s", tn, state,
+                  comm ? comm : "?", (wchan && *wchan && strcmp (wchan, "0")) ? wchan : "-");
+            shown++;
+            g_free (comm); g_free (wchan); g_free (stat);
+        }
+        if (td) g_dir_close (td);
+        g_free (tdir);
+    }
+
+    if (!shown)
+        mlog ("threads: no web process found under this browser");
+
+    g_ptr_array_free (webs, TRUE);
+    g_hash_table_destroy (parent);
+}
+
 /* ---------------------------------------------------------------- hooks */
 
 static void
@@ -1631,7 +1769,10 @@ big_usage_options (GString *s)
 "                      in a config file makes it permanent\n"
 "  --cam-fix           relax over-tight getUserMedia constraints, retry\n"
 "                      with looser ones, and hold the capture stream so a\n"
-"                      second call is instant\n"
+"                      second call is instant\n""                      Only these camera flags change the camera. The\n"
+"                      tracing and compat flags share the same script\n"
+"                      but hand the page its tracks untouched; the log's\n"
+"                      shim line says repair:true when anything is on\n"
 "  --list-cameras      print every format, size and frame rate each camera\n"
 "                      offers, with the aspect ratio of each, then exit.\n"
 "                      Use it to check a site is asking for a shape the\n"
@@ -1650,6 +1791,10 @@ big_usage_options (GString *s)
 "  --no-cam-drop-audio with --cam-fix, fail instead of handing a site\n"
 "                      video only when the machine has no microphone\n"
 "  --cam-max WxH@FPS   cap relaxed constraints (default: %dx%d@%d)\n"
+"  --no-mic            give pages the camera but never the microphone. A\n"
+"                      diagnostic: if a freeze goes away, the audio path\n"
+"                      is the cause (the audio track here reports\n"
+"                      sampleRate 0, which is not a valid rate)\n"
 "  --web-compat        supply APIs WebKitGTK does not implement, currently\n"
 "                      screen.orientation. Zoom's media code reads\n"
 "                      screen.orientation.type and throws without it\n"
@@ -1721,7 +1866,11 @@ big_usage_options (GString *s)
 "                      gst-inspect-1.0 alsadeviceprovider\n"
 "                      Put audio = alsa in a config file to have this\n"
 "                      every run, on a machine with no sound server\n"
-"  --gst-rank SPEC     set GST_PLUGIN_FEATURE_RANK yourself, e.g.\n"
+"  --no-va             rank every VA-API element out: no hardware video\n"
+"                      encoding or decoding. With --no-dmabuf and\n"
+"                      --no-hw-decode this is an all-software media path,\n"
+"                      which is the test for a GPU driver problem\n"
+"  --gst-rank SPEC     add to GST_PLUGIN_FEATURE_RANK yourself, e.g.\n"
 "                      'pulsedeviceprovider:NONE'\n"
 "  --gst-debug SPEC    set GST_DEBUG (e.g. 'v4l2*:6,webrtc*:5')\n"
 "  --gst-debug-level N set GST_DEBUG to a global level\n"
@@ -1757,7 +1906,7 @@ big_parse_arg (int argc, char **argv, int *i)
     /* ---- camera ---- */
     if (!strcmp (a, "--list-cameras"))        { g_list_cameras = TRUE; return TRUE; }
     if (!strcmp (a, "--warm-cam"))            { g_warm_cam = TRUE; return TRUE; }
-    if (!strcmp (a, "--cam-fix"))             { g_cam_fix = TRUE; return TRUE; }
+    if (!strcmp (a, "--cam-fix"))             { g_cam_fix = g_cam_repair = TRUE; return TRUE; }
     if (!strcmp (a, "--cam-share")) {
         /*
          * Hand a repeated request the stream that is already open, and
@@ -1766,6 +1915,7 @@ big_parse_arg (int argc, char **argv, int *i)
          * produces a frame, and the page waits for it forever.
          */
         g_cam_fix       = TRUE;
+        g_cam_repair    = TRUE;
         g_cam_relax     = FALSE;
         g_cam_keepalive = TRUE;
         g_cam_retries   = 0;
@@ -1775,7 +1925,7 @@ big_parse_arg (int argc, char **argv, int *i)
     if (!strcmp (a, "--media-watchdog"))      { g_media_watchdog = TRUE; return TRUE; }
     if (!strcmp (a, "--auto-reload"))         { g_auto_reload = TRUE; return TRUE; }
     if (!strcmp (a, "--fix-media")) {         /* everything at once */
-        g_cam_fix = g_prewarm = g_media_watchdog = g_auto_reload = TRUE;
+        g_cam_fix = g_cam_repair = g_prewarm = g_media_watchdog = g_auto_reload = TRUE;
         return TRUE;
     }
     if (!strcmp (a, "--no-prewarm"))          { g_prewarm = FALSE; return TRUE; }
@@ -1787,6 +1937,12 @@ big_parse_arg (int argc, char **argv, int *i)
     if (!strcmp (a, "--warm-timeout")) {
         NEXT ("--warm-timeout");
         g_warm_timeout = MAX (1, atoi (argv[++(*i)]));
+        return TRUE;
+    }
+    if (!strcmp (a, "--no-mic")) {
+        g_no_mic    = TRUE;
+        g_cam_fix   = TRUE;
+        g_cam_relax = FALSE;
         return TRUE;
     }
     if (!strcmp (a, "--web-compat")) {
@@ -1947,7 +2103,7 @@ big_parse_arg (int argc, char **argv, int *i)
         return TRUE;
     }
 
-    if (!strcmp (a, "--audio-pulse")) { g_gst_rank = NULL; return TRUE; }
+    if (!strcmp (a, "--audio-pulse")) { g_clear_pointer (&g_gst_rank, g_free); return TRUE; }
     if (!strcmp (a, "--audio-alsa")) {
         /*
          * Rank PulseAudio's elements out so autoaudiosink/autoaudiosrc
@@ -1959,14 +2115,18 @@ big_parse_arg (int argc, char **argv, int *i)
          * device providers, so the microphone still depends on
          * alsadeviceprovider being installed. Checked, not assumed.
          */
-        g_gst_rank = "pulsesink:NONE,pulsesrc:NONE,"
-                     "alsasink:PRIMARY,alsasrc:PRIMARY,"
-                     "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY";
+        gst_rank_add ("pulsesink:NONE,pulsesrc:NONE,"
+                      "alsasink:PRIMARY,alsasrc:PRIMARY,"
+                      "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY");
+        return TRUE;
+    }
+    if (!strcmp (a, "--no-va")) {
+        gst_rank_add (VA_RANK_OFF);
         return TRUE;
     }
     if (!strcmp (a, "--gst-rank")) {
         NEXT ("--gst-rank");
-        g_gst_rank = argv[++(*i)];
+        gst_rank_add (argv[++(*i)]);
         return TRUE;
     }
 
@@ -2043,9 +2203,19 @@ big_cfg_set (const char *key, const char *value)
      * repeated request a clone of the live track over the single open,
      * which is what the other engines do internally.
      */
+    if (!g_ascii_strcasecmp (key, "web_compat")) {
+        if (truthy_value (value)) {
+            g_web_compat = TRUE;
+            g_cam_fix    = TRUE;
+            g_cam_relax  = FALSE;
+        }
+        return TRUE;
+    }
+
     if (!g_ascii_strcasecmp (key, "cam_share")) {
         if (truthy_value (value)) {
             g_cam_fix       = TRUE;
+            g_cam_repair    = TRUE;
             g_cam_relax     = FALSE;
             g_cam_keepalive = TRUE;
             g_cam_retries   = 0;
@@ -2057,12 +2227,12 @@ big_cfg_set (const char *key, const char *value)
         return FALSE;
 
     if (!g_ascii_strcasecmp (value, "alsa")) {
-        g_gst_rank = "pulsesink:NONE,pulsesrc:NONE,"
-                     "alsasink:PRIMARY,alsasrc:PRIMARY,"
-                     "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY";
+        gst_rank_add ("pulsesink:NONE,pulsesrc:NONE,"
+                      "alsasink:PRIMARY,alsasrc:PRIMARY,"
+                      "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY");
     } else if (!g_ascii_strcasecmp (value, "pulse") ||
                !g_ascii_strcasecmp (value, "auto")) {
-        g_gst_rank = NULL;
+        g_clear_pointer (&g_gst_rank, g_free);
     } else {
         g_printerr ("config: audio must be alsa, pulse or auto\n");
     }
@@ -2110,7 +2280,6 @@ codec_check (void)
      */
     static const struct { const char *element; const char *what; } need[] = {
         { "webrtcbin",   "WebRTC             gst-plugins-bad, built with libnice" },
-        { "nicesrc",     "ICE                libnice, built with GStreamer support" },
         { "srtpenc",     "SRTP               gst-plugins-bad, needs libsrtp2" },
         { "dtlssrtpenc", "DTLS               gst-plugins-bad, needs OpenSSL" },
         { "rtpbin",      "RTP                gst-plugins-good" },
@@ -2141,6 +2310,27 @@ codec_check (void)
                          " or openh264enc from gst-plugins-bad\n");
     if (x264) gst_object_unref (x264);
     if (oh)   gst_object_unref (oh);
+
+    /*
+     * webrtcbin existing is not the same as it working. Without an ICE
+     * agent it gathers no candidates and createAnswer() never settles -
+     * a call that hangs with no error at all. Worth building one once.
+     */
+    GstElement *wrb = gst_element_factory_make ("webrtcbin", NULL);
+    if (!wrb) {
+        g_string_append (missing, "  webrtcbin    could not be created at all\n");
+    } else {
+        GObject *agent = NULL;
+        g_object_get (wrb, "ice-agent", &agent, NULL);
+        if (!agent)
+            g_string_append (missing,
+                             "  ICE agent    webrtcbin has none: no candidates will be\n"
+                             "               gathered and createAnswer() never returns.\n"
+                             "               libnice with GStreamer support is what provides it\n");
+        else
+            g_object_unref (agent);
+        gst_object_unref (wrb);
+    }
 
     if (missing->len) {
         mlog ("gstreamer: these are missing, and pages will fail without them:");
@@ -2386,6 +2576,12 @@ big_key (Win *w, guint key, gboolean shift)
     case GDK_KEY_v:
         toast_show (w, "media state -> stderr", 2);
         view_eval (w->view, MEDIA_DUMP_JS);
+        return TRUE;
+    case GDK_KEY_t:
+        /* Deliberately not view_eval: a frozen web process cannot answer,
+         * and this reads /proc, which does not need it to. */
+        toast_show (w, "web process threads -> stderr", 2);
+        threads_dump ();
         return TRUE;
     default:
         return FALSE;
