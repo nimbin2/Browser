@@ -1,0 +1,16 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCaptureSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCaptureSource.cpp
+@@ -298,7 +298,13 @@
+ void GStreamerVideoCaptureSource::generatePresets()
+ {
+     Vector<VideoPreset> presets;
++    // A V4L2 device may list several sizes in one structure, for instance
++    // width=640, height={ 480, 360 }. Split them into one structure each,
++    // or every size listed that way is skipped below as not discrete - on
++    // a typical laptop camera that is every 4:3 mode.
+     auto caps = m_capturer->caps();
++    if (caps)
++        caps = adoptGRef(gst_caps_normalize(gst_caps_copy(caps.get())));
+     for (unsigned i = 0; i < gst_caps_get_size(caps.get()); i++) {
+         GstStructure* str = gst_caps_get_structure(caps.get(), i);
+ 

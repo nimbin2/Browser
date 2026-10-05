@@ -1,0 +1,15 @@
+--- a/gst-libs/gst/gl/gstglupload.c
++++ b/gst-libs/gst/gl/gstglupload.c
+@@ -1695,8 +1695,10 @@
+      * matches the size we use to import the dmabuf. @outcaps will remains
+      * display resolution as expected.
+      */
+-    out_info->width = meta->width;
+-    out_info->height = meta->height;
++    if (meta) {
++      out_info->width = meta->width;
++      out_info->height = meta->height;
++    }
+ 
+     /*
+      * When we zero-copy tiles, we need to propagate the strides, which contains

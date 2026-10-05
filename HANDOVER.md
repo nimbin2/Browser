@@ -1,170 +1,223 @@
-# browser-mini / browser-big: handover notes
+# Handover
 
-State at **4.18.0 (build 4bbf154)**. Written for a fresh chat whose job is
-to clean the code up. Read this first, then the README.
+The state of browser-mini / browser-big at 4.39.0, for whoever picks it up
+next. The short version: video calls work on WebKitGTK 2.54.0 with
+GStreamer 1.28.7, given three upstream patches and the defaults in
+browser-big.
 
-## 1. The project
+## Test setup
 
-| File | Lines | What |
-| --- | --- | --- |
-| `browser_core.c` | ~7800 | window, popups, keys, history, downloads, search, media mode, config, watchdogs |
-| `browser_core.h` | ~180 | `Win` struct, `BrowserApp` hooks, `LOG` macro |
-| `browser-big.c` | ~2660 | camera / GStreamer / WebRTC layer on top of the core |
-| `browser-mini.c` | 22 | fills in `BrowserApp`, calls `browser_main()` |
-| `Makefile` | | `PREFIX ?= /usr`, `install`, `uninstall`, `clean`, `version` |
+- ThinkPad T14 Gen1 (AMD). Self-built WebKitGTK 2.54.0, GStreamer 1.28.7,
+  GTK 4.20.3. No sound server (`audio = alsa`).
+- Site: a mediasoup-based chat (mediasoup-client, `Safari12` handler,
+  VP8-only router, socket.io signalling).
+- Reference: the WebRTC samples, `peerconnection/pc1` for a call without a
+  server.
 
-- WebKitGTK 6.0 (GTK4) only. `make` builds both binaries.
-- Build id = md5 of the sources (`make version`).
-- The user's preferences apply: md5 build versioning reported at the end of
-  each reply, Makefile defaults to `/usr/bin` with `clean` and `uninstall`,
-  a short README branded "100% Vibecode but tested", no Ubuntu in the README,
-  no extra files unless asked, minimal testing.
+## Upstream bugs (need patching, not configuration)
 
-## 2. The user's system (verified in the logs)
+### 1. WebKit: camera frame flood (WebKit PR 74373, open)
 
-- Linux From Scratch, pkgusr package users, **no systemd**, native Wayland,
-  plain ALSA (no PulseAudio/PipeWire running), no desktop portal,
-  `XDG_RUNTIME_DIR=/tmp/xdg-n76310` (mode 042770).
-- Lenovo 20UD (AMD Renoir): Mesa radeonsi, RADV Vulkan, VA-API H.264/HEVC
-  work; firmware complete.
-- **WebKitGTK 2.52.5** (upgraded from 2.50.5 during this work),
-  GTK 4.20.3, GLib 2.88.3, GStreamer 1.28.6. 2.52 defaults to librice
-  instead of libnice for ICE.
-- WebKit build flags: `USE_GSTREAMER_WEBRTC=ON` (the **only** WebRTC backend
-  the GTK port has; OFF means no WebRTC at all), `USE_LIBRICE=ON`,
-  `ENABLE_WEB_RTC=ON`, `ENABLE_MEDIA_STREAM=ON`, no bubblewrap sandbox.
-  The pkgusr script had `USE_GTK4=OFF`, which builds the wrong library for
-  these browsers; it must be `ON`.
-- Camera `/dev/video1`: MJPEG up to 1280x720@30, raw YUY2/DMA_DRM 1280x720
-  only @10. Plain `gst-launch v4l2src` starts instantly (60 frames in 2.3 s).
-- gdb is **not** installed, and `wchan` reads 0 for every thread on this
-  kernel. Neither can be used for thread dumps.
-- The user's wrapper `su - user -c 'cmd "$@"' -- "$@"` ate the first
-  argument (it becomes `$0`). Fixed by `-- browser-mini "$@"`.
+`GStreamerVideoCapturer::createConverter` sets `drop-only` on `videorate`
+only for GStreamer < 1.28. The capture pipeline runs with base time 0, so
+buffer PTS are absolute CLOCK_MONOTONIC values, and `videorate` fills the
+gap from 0 with uptime x fps copies. The result is a frozen or black camera,
+400+ encoded frames per second, and a pinned CPU. It also affects 2.52.
 
-## 3. Done, and working
+```
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCapturer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCapturer.cpp
+@@ -135,6 +135,10 @@
+ 
+     auto* bin = gst_bin_new(nullptr);
+     auto* videorate = makeGStreamerElement("videorate"_s, "videorate"_s);
++    // The capture pipeline runs with base time 0, so buffer PTS are absolute
++    // CLOCK_MONOTONIC values. Without skip-to-first, videorate fills the gap
++    // from segment start with uptime x fps duplicate frames (WebKit PR 74373).
++    g_object_set(videorate, "skip-to-first", TRUE, nullptr);
+ 
+     // The workaround below doesn't seem necessary anymore in GStreamer 1.28 and beyond.
+     // Fixed by: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/commit/6f623af4d745efaacd0c8639b99536def4a65c78
+```
 
-**Core**
-- `-h` answered after the config is read, so it prints effective values.
-- Ctrl+K rows no longer load search templates as URLs.
-- Popups unified: things you type into are top centre, messages top right,
-  the address bottom left. Non-interactive panels fade on hover.
-- Quiet config: unknown keys in swov's shared file are counted, not listed.
-- Camera/mic permission prompt (Enter = allow, Esc = deny), remembered per
-  site in `permissions.tsv`; `media = ask|allow|deny`; `--forget-perms`.
-- Find-in-page no longer freezes big pages: 1000-match cap, 120 ms
-  debounce, one `search()` pass.
-- Fatal messages survive `abort()`: a signal handler drains the log pipe;
-  backtraces via `-rdynamic`.
-- Watchdogs: web process spinning (every 5 s; from 4.15 with timestamps,
-  a "calm again after Ns" line, and a GStreamer-vs-JIT hint), UI main loop
-  blocked, and a missing Wayland frame callback.
-- `--gsk` defaults to `gl` (GTK's Vulkan renderer deadlocked on resize).
-- `--paths` (4.12+) lists every file and directory written, including the
-  download rules, search keywords (with built-ins), start page colour and
-  media temp dir.
-- Start page: flat colour, with a toggleable swatch palette at the top;
-  the choice is saved in `~/.local/share/wkview/start-bg`.
-- Ctrl+P shows the whole URL, wrapped, and toggles (4.13).
-- Media mode (4.16/4.17): F2 toggles it and a frame shows it. Ctrl+click
-  sends a video to `player` (mpv) and an image to `image_viewer` (imv);
-  images are downloaded with libsoup first. `--player` on the command line
-  starts in the mode.
-- Built-in search keywords (4.18): g Google (default), d DuckDuckGo,
-  w Wikipedia, s SDL3 wiki via DuckDuckGo. The user's own keywords win by
-  name.
+Check: `pc1` encodes about 90 frames per 3 s report (30 fps).
 
-**browser-big**
-- Media workarounds are opt-in only (the user's rule: clean by default).
-- 4.14 fix: the tracing and compat flags (`--rtc-trace`, `--web-compat`,
-  `--no-mic`, offer fixes) used to silently turn on camera *cloning and
-  holding*. On 2.52 that froze the page's camera after ~1 s. Now only
-  `--cam-fix`, `--cam-share`, `--fix-media` and `cam_share=yes` touch the
-  camera; the log's `shim` line says `repair:true|false`.
-- `--list-cameras`, `--media-debug`, `--gl-info`, `--list-features`,
-  `--feature NAME[=on|off]` all verified useful.
+### 2. GStreamer 1.28: glupload NULL video meta (fixed on main)
 
-## 4. Root causes found
+`_dma_buf_upload_accept` in `gst-libs/gst/gl/gstglupload.c` does
+`out_info->width = meta->width` without checking `meta`. It runs on a format
+change with a dma-buf buffer that has no video meta, which is exactly the
+site's second `getUserMedia`. The web process crashes (SIGSEGV on the
+`vqueue:src` thread). 1.26 had the check.
 
-| Symptom | Cause | Status |
-| --- | --- | --- |
-| WebRTC never connects, `createAnswer` never settles | WebKitGTK **2.50.5** bug: `create-answer` never emitted to webrtcbin (log proves `_create_answer_task` absent, zero warnings) | **fixed by 2.52.5**, pc1 sample works |
-| pc1 camera freezes after 1 s on 2.52 | **our** shim cloned the track (see 4.14) | fixed |
-| Zoom crash: `Trying to dispose element … video-frame-converter-gl … PAUSED`, segfaults in libc/libgstbase | WebKit 2.52 use-after-free in its GL video frame converter | avoided with `--feature WebCodecsVideo=off` |
-| Zoom still crashes with WebCodecs off: camera freezes, Zoom releases it, the process dies on teardown | WebKit capture teardown bug (heap corruption, `free(): invalid pointer`) | **open** |
-| 20–30 s frozen preview at 400 % CPU (`queue*:src`, `multiqueue*:src`) | `v4l2src` blocked downstream for ~28 s, then "Timestamp does not correlate with any clock". Seen in `-n` runs, where playback went to a **PulseAudio** sink with clock-skew warnings (libpulse autospawn is suspected) | **open**: the run with `audio = alsa` was never reported |
-| `--cam-exact 640x480@30` ignored, 1280x720 returned with no error | WebKit 2.52 ignores exact capture constraints | WebKit bug; nothing to do |
-| `screen.orientation` missing | WebKitGTK does not implement it; Zoom throws | `--web-compat` supplies it |
-| GoDaddy login refused (`fp` → 429) | bot detection; changing the UA did not help | not ours; use another browser |
-| TTY switch aborts every browser | GTK Wayland dispatch → WebKit abort | not ours |
+```
+--- a/gst-libs/gst/gl/gstglupload.c
++++ b/gst-libs/gst/gl/gstglupload.c
+@@ -1695,8 +1695,10 @@
+      * matches the size we use to import the dmabuf. @outcaps will remains
+      * display resolution as expected.
+      */
+-    out_info->width = meta->width;
+-    out_info->height = meta->height;
++    if (meta) {
++      out_info->width = meta->width;
++      out_info->height = meta->height;
++    }
+ 
+     /*
+      * When we zero-copy tiles, we need to propagate the strides, which contains
+```
 
-## 5. Tried, and wrong or useless (do not repeat)
+Without the patch: `WEBKIT_GST_DISABLE_GL_SINK=1`.
 
-- A "stale binary" theory for the argument bug: it was the `su` wrapper.
-- `--audio-alsa` aimed at the device provider: `GST_PLUGIN_FEATURE_RANK`
-  does not rank device providers. Retargeted at the elements.
-- Requiring a `nicesrc` element: wrong. The real check builds a webrtcbin
-  and queries its `ice-agent`.
-- "gst-debug compiled out", claimed twice: wrong both times. Use the
-  `GST_DISABLE_GST_DEBUG` macro, not grep or `gst_debug_is_active()`.
-- `dbus-launch`: caused a 61 s hang (a bus with no portal behind it).
-- The GPU driver theory: an all-software run froze the same way.
-- `--fix-webrtc` does not enable tracing (misread once as a regression).
-- "Switch to the libwebrtc backend": that option does not exist for GTK.
-- `WebCodecsVideoEnabled`: wrong feature name; it is `WebCodecsVideo`.
-- `--cam-force` (ideal) and `--cam-exact`: ignored by WebKit 2.52.
-- `--no-hw-decode` and `--no-gpu`: no help with the freeze or the crash.
-- `wchan` thread dumps: always 0 on this kernel.
-- GStreamer's log has colour codes when redirected; strip them with
-  `sed -E 's/\x1b\[[0-9;]*m//g'` before grepping.
+### 3. WebKit: camera sizes given as a list are skipped
 
-## 6. Cleanup candidates for the next chat
+`GStreamerVideoCaptureSource::generatePresets` reads each caps structure
+with `gst_structure_get(..., "width", G_TYPE_INT, ..., "height",
+G_TYPE_INT, ...)` and skips it when that fails. V4L2 lists some modes as a
+size list in one structure. The T14 camera (`--list-cameras`):
 
-**Likely obsolete on 2.52**, so check each and remove what is dead:
-- `--sdp-ssrc-fix`, `--rtc-params-fix`, `--fix-webrtc`: written against
-  2.50 behaviour, before the real bug (the `createAnswer` hang) was known.
-- The camera repair shim: `--cam-fix`, `--cam-share`, relax/retry/keepalive/
-  hold/drop-audio, `--cam-scale*`, `--cam-force`, `--cam-exact`,
-  `--cam-match`, `--cam-retries`, `--cam-hold`. Cloning is actively harmful
-  on 2.52, and exact constraints are ignored.
-- `--prewarm`, `--warm-cam`, `--media-watchdog`, `--auto-reload`,
-  `--load-timeout`, `--max-reloads`, `--stall-timeout`: never shown to help.
-- `--no-mic`: its diagnostic question has been answered.
+```
+640 x { (int)480, (int)360 }   30/1
+320 x { (int)240, (int)180 }   30/1
+```
 
-**Keep:** `--rtc-trace`, `--media-debug`, `--list-cameras`, `--gst-*`,
-`--web-compat` (screen.orientation), `--feature`, `--list-features`,
-`--gl-info`, the watchdogs, `--paths`, the permission prompt, media mode,
-search keywords, `--audio-alsa` / `audio = alsa`.
+These are all of its 4:3 modes, in every format (DMA_DRM, MJPEG, YUY2).
+WebKit had no 4:3 preset, so `{max: 20}` gave 848x480@20 and no frame rate
+gave 1280x720@10. `gst_caps_normalize` splits them into discrete
+structures (checked with the local GStreamer: 640x480, 640x360, 320x240,
+320x180).
 
-**Code smells worth a pass:**
-- `browser_core.c` is ~7800 lines in one file. Natural splits: config,
-  history, downloads, search, popup/omni, media mode, watchdogs, start page.
-- `LOG` lines are inconsistent: only browser-big's `mlog` and the watchdog
-  carry timestamps.
-- The shim JS is one large C string in `browser-big.c`; it could be a
-  separate `.js` embedded at build time.
-- The README is ~1200 lines, with long debugging narratives from the 2.50
-  era; trim it to what is still true on 2.52.
+```
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCaptureSource.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCaptureSource.cpp
+@@ -298,7 +298,13 @@
+ void GStreamerVideoCaptureSource::generatePresets()
+ {
+     Vector<VideoPreset> presets;
++    // A V4L2 device may list several sizes in one structure, for instance
++    // width=640, height={ 480, 360 }. Split them into one structure each,
++    // or every size listed that way is skipped below as not discrete - on
++    // a typical laptop camera that is every 4:3 mode.
+     auto caps = m_capturer->caps();
++    if (caps)
++        caps = adoptGRef(gst_caps_normalize(gst_caps_copy(caps.get())));
+     for (unsigned i = 0; i < gst_caps_get_size(caps.get()); i++) {
+         GstStructure* str = gst_caps_get_structure(caps.get(), i);
+```
 
-## 7. Open questions to settle first
+Check: `--rtc-trace` shows the video track at 320x240, aspect 1.333.
 
-1. pc1 **with** the config (`audio = alsa`, no `-n`): is the 20–30 s freeze
-   gone? If yes, the PulseAudio sink clock was the cause, and browser-big
-   should force ALSA or warn when `autoaudiosink` picks pulse.
-2. `command -v pulseaudio`: is libpulse autospawning a daemon?
-3. Zoom with `--web-compat --feature WebCodecsVideo=off`, then
-   `dmesg | grep -iE 'segfault|WebKitWeb'`: which library dies now?
-4. arte.tv videos fail in both browsers. The decoder check and the three
-   test pages were proposed but never run (see the last messages: check
-   for `avdec_aac`/`faad`/`fdkaacdec`, `avdec_h264`/`vah264dec`,
-   `qtdemux`, `h264parse`, `aacparse`).
-5. A gdb build would give real backtraces for the WebKit crash reports.
+All three patches are needed again for each new WebKit or GStreamer until
+upstream ships them.
 
-## 8. Useful test pages
+## WebKit behaviour browser-big works around (all default)
 
-- WebRTC loopback: `https://webrtc.github.io/samples/src/content/peerconnection/pc1/`
-- No camera needed: `…/datachannel/basic/` and `…/capture/canvas-pc/`
-- Camera only: `…/getusermedia/gum/`
-- Zoom test meeting: `zoom.us/test`
-- Plain MP4: `https://www.w3schools.com/html/mov_bbb.mp4`
-- MSE/HLS: `https://hlsjs.video-dev.org/demo/`
+Each item was found in the WebKit 2.52.6 / 2.54.0 sources and confirmed by
+a run.
+
+1. **librice finds no srflx candidate.** `RiceBackend::resolveAddress`
+   keeps only the first DNS answer (upstream FIXME), and the STUN address is
+   built as `host:port` without IPv6 brackets. Measured: librice host-only,
+   libnice srflx in 0.11 s. Default is libnice
+   (`WEBKIT_GST_DISABLE_WEBRTC_NETWORK_SANDBOX=1`); `ice = rice` undoes it.
+2. **Encoder fixed to the first codec of the own offer.**
+   `doSetLocalDescription` -> `linkOutgoingSources` ->
+   `configurePacketizers` links the first codec it can encode. The answer
+   is never consulted, and `codecPreferencesChanged` refuses once the bin
+   runs. When a track is added to an existing connection (renegotiation),
+   the source is configured at `addTransceiver` time, so only
+   `setCodecPreferences` switches it.
+   - Fix: `setCodecPreferences(VP8 first)` on transceivers with a video
+     sender track, plus VP8 moved first in the SDP (`sdpPreferCodecs`).
+   - The mediasoup probe pc (no tracks) is left alone; reordering it broke
+     mediasoup's device caps.
+3. **No `a=ssrc` lines, and the real SSRC is unknown until connected.**
+   mediasoup-client reads the SSRC from `pc.localDescription` after SLD and
+   registers the producer under it. A mismatch drops every packet.
+   - Fix: inject a placeholder SSRC (`sdpAddSsrc`). After SLD, learn the
+     real one from `sender.getStats()` in the background (outbound-rtp, up
+     to 15 s).
+   - Rewrite `localDescription` on the pc (`hookLD`), and hold the one
+     WebSocket message that contains the placeholder until it can be
+     rewritten (`ssrc-ws`).
+4. **Payload types differ between the probe and the real pc.** The answer
+   carries the probe's numbers (VP8 = 111); WebKit sends its own (96).
+   Fix: in the same held message, `codecs[0].payloadType` and the rtx
+   `apt` are set to what the stats say is sent (`pt-fixed`).
+5. **`RTCRtpSendParameters.codecs` required.** Filled in from
+   `getParameters()` when a library omits it.
+6. **A MediaStream player never starts while an audio track delivers
+   nothing.** Remote cameras without a microphone stay at readyState 0
+   although frames are decoded.
+   - Fix: after 2.5 s at readyState 0, with live video and silent audio, the
+     element gets a video-only stream; the `srcObject` getter keeps
+     returning the page's stream.
+   - The original goes back on audio `unmute`. Confirmed: every such cam
+     played right after `video-audio-split`.
+7. **`query-permission-state`** (new in 2.54) is answered from
+   `permissions.tsv`. Unanswered means "prompt", and sites get no device
+   labels.
+8. **Microphone choice.** Device labels are hidden until the first grant,
+   so `mic_match` swaps the matching input into the stream after the first
+   successful `getUserMedia` (`mic-swapped`).
+
+9. **Camera frame rate.** `bestSupportedSizeFrameRateAndZoom` skips
+   every preset whose frame-rate list lacks the exact requested rate. The
+   site asks 320x240 with `frameRate {max: 20}`; 320x240 only runs at 30,
+   so even with patch 3 a 16:9 mode (848x480@20) won.
+   - Fix: `looseFps()` drops a soft frameRate in `getUserMedia` and
+     `applyConstraints` (exact and min are kept, `gum-fps-loosened`).
+     `cam_size_fix = no` undoes it.
+   - Chrome scales per track and drops frames instead.
+10. **`mic_match` wins** over the site's own audio deviceId (`exact`). The
+    site's second request named the headset jack again.
+
+`fix_webrtc = no` turns off 3-6. `--no-cam-fix` injects no script at all.
+
+## Removed (proven not to work)
+
+- `--cam-exact`: WebKit answered an exact 320x240 with 424x240 instead of
+  failing.
+- `--cam-force`: a preference that WebKit ignored.
+- `--cam-scale`: the canvas track has no deviceId or label, and the site
+  rejected it at once.
+- `--max-bitrate`, `--max-fps`: `setParameters` was accepted, and the
+  send rate did not change.
+- `fixSize` (4.38, re-apply the size once the probe track ended): the log
+  showed no other track open (`waited:0`) and still 1280x720. The real
+  cause was patch 3.
+- `--cam-share-clone`, `--cam-hold`: `MediaStreamTrack.clone()` goes black
+  after about 1 s on 2.52. Sharing the track itself works.
+
+## Open issues
+
+- **No keyframe after loss.** A remote stream that loses a few packets
+  stops decoding. FIRs are sent (`in-video.fir` climbs) but `keys` does not
+  move. Either the sender or server throttles keyframes, or the depayloader
+  waits for one it does not recognise. `rtpvp8depay2` (gst-plugins-rs) is
+  installed alongside `rtpvp8depay`; ranking it out changed nothing.
+- `GStreamer-RTP-CRITICAL gst_rtp_header_extension_get_id` on receiving
+  streams: `gstrtpbasedepayload.c:646` walks a header extension list with a
+  NULL entry on a caps event. Harmless so far.
+- The three patches above are not upstream yet.
+
+## Checks that pin a problem down
+
+- `--rtc-trace`: `sdp` (full `pt name` lists), `rtc-stats` (`out-*`,
+  `far-*`, `in-*` with fir/keys), `video-state`, `video-attach`,
+  `ssrc-real` / `ssrc-ws` / `pt-fixed`, `codec-mismatch`.
+- `pc1` at 30 fps: the camera path and the WebKit patch are fine.
+- A LibreWolf run of the same room separates site bugs from ours.
+- gdb attached to `WebKitWebProcess` before the camera starts (see README).
+
+## Build notes
+
+- On 2.54, `WebKitPointerLockPermissionRequest` is only declared when
+  WebKit is built with pointer lock (`#if ENABLE(POINTER_LOCK)` in
+  `webkit.h.in`), so both uses are behind
+  `#ifdef WEBKIT_TYPE_POINTER_LOCK_PERMISSION_REQUEST`.
+- `MAX`/`MIN`/`CLAMP` evaluate their argument twice. Option values are read
+  into a local first (`argv[++i]` inside `MAX` swallowed the next option).
+- Always ship all seven files together; `make version` identifies the
+  build.

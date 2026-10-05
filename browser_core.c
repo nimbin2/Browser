@@ -108,6 +108,7 @@ static char       *g_data_dir;     /* profile data dir, NULL when private */
 static char       *g_profile;      /* NULL -> "default" */
 static gboolean    g_clear_data;
 static char       *g_user_agent;
+static gboolean    g_allow_popups; /* --allow-popups: window.open without a click */
 static gboolean    g_follow_page_title = TRUE; /* see --title / --page-title */
 static char       *g_clip_cmd;     /* --clip-cmd, NULL -> wl-copy  */
 static gboolean    g_no_middle_paste = TRUE;  /* --enable-middle-click-paste */
@@ -142,6 +143,12 @@ static int         g_real_stderr = -1;
 static int         g_noise_fd    = -1;   /* read end, for the final drain */
 static GHashTable *g_noise;          /* line -> occurrences */
 static gboolean    g_no_sandbox;
+
+/* --lock-page / --lock-site: this window shows one address, or one site,
+ * and nothing else. */
+typedef enum { LOCK_OFF, LOCK_PAGE, LOCK_SITE } LockMode;
+static LockMode    g_lock_mode;
+static char       *g_lock_uri;       /* the address as it was opened */
 static gboolean    g_want_page_title;
 static char       *g_css_owned;    /* when --css came from the config */
 
@@ -191,6 +198,7 @@ static gboolean   on_decide_policy (WebKitWebView *view, WebKitPolicyDecision *d
                                     WebKitPolicyDecisionType type, gpointer u);
 static gboolean   on_permission    (WebKitWebView *view, WebKitPermissionRequest *req,
                                     gpointer u);
+static Win       *win_for_view     (WebKitWebView *view);
 static GtkWidget *on_create        (WebKitWebView *view, WebKitNavigationAction *act,
                                     gpointer u);
 static void       on_ready_to_show (WebKitWebView *view, gpointer u);
@@ -259,20 +267,31 @@ elide (const char *s, int max_chars)
 
 /* ------------------------------------------------------------- helpers */
 
+/*
+ * GST_PLUGIN_FEATURE_RANK is one variable that several options feed, and
+ * the user may have set it too. Append, never replace: GStreamer applies
+ * the entries in order, so a later one for the same element wins.
+ */
 void
-settings_set_bool_if_exists (WebKitSettings *s, const char *prop, gboolean value)
+gst_rank_env_add (const char *spec)
 {
-    if (g_object_class_find_property (G_OBJECT_GET_CLASS (s), prop))
-        g_object_set (G_OBJECT (s), prop, value, NULL);
-    else
-        LOG ("note: WebKitSettings property not supported: %s\n", prop);
+    const char *had = g_getenv ("GST_PLUGIN_FEATURE_RANK");
+    char       *v   = (had && *had) ? g_strconcat (had, ",", spec, NULL) : g_strdup (spec);
+
+    g_setenv ("GST_PLUGIN_FEATURE_RANK", v, TRUE);
+    g_free (v);
 }
 
+/* A front-end asking for a WebKit runtime feature, same as --feature. */
 void
-object_set_string_if_exists (GObject *o, const char *prop, const char *value)
+feature_request (const char *spec)
 {
-    if (g_object_class_find_property (G_OBJECT_GET_CLASS (o), prop))
-        g_object_set (o, prop, value, NULL);
+    if (!g_features)
+        g_features = g_ptr_array_new_with_free_func (g_free);
+    for (guint i = 0; i < g_features->len; i++)
+        if (!g_strcmp0 (g_ptr_array_index (g_features, i), spec))
+            return;
+    g_ptr_array_add (g_features, g_strdup (spec));
 }
 
 /* "example.com" -> "https://example.com", "./page.html" -> "file:///...". */
@@ -671,9 +690,49 @@ dl_dir_for_uri (const char *uri)
     return (g_download_dir && *g_download_dir) ? g_download_dir : ".";
 }
 
-/* Which rule is answering for this address right now. */
+/*
+ * --lock-page / --lock-site. The address bar, a link, a redirect, a
+ * script and a popup all end up in decide-policy, so one check there
+ * covers every way to leave the page. A fragment is the same page.
+ */
+static gboolean
+nav_allowed (const char *uri)
+{
+    if (g_lock_mode == LOCK_OFF || !g_lock_uri || !uri || !*uri)
+        return TRUE;
+
+    if (g_lock_mode == LOCK_SITE) {
+        char *a = uri_host (uri);
+        char *b = uri_host (g_lock_uri);
+
+        /* A file:// address has no host and so has no site either. Rather
+         * than letting every local file through, or none, the lock falls
+         * back to the single page. */
+        if (a && b && *a && *b) {
+            gboolean ok = !g_ascii_strcasecmp (a, b);
+            g_free (a);
+            g_free (b);
+            return ok;
+        }
+        g_free (a);
+        g_free (b);
+    }
+
+    gsize n = strcspn (uri, "#");
+    gsize m = strcspn (g_lock_uri, "#");
+    return n == m && !strncmp (uri, g_lock_uri, n);
+}
+
+/*
+ * Which scope the popup opens on. Not the same as which rule answers for
+ * the address right now.
+ * A page with a rule of its own offers to change that rule. A page that
+ * is only covered by its site's rule offers a rule of its own instead:
+ * somebody setting a directory while looking at a subpage means that
+ * subpage, and the narrower rule wins without disturbing the site's.
+ */
 static DlScope
-dl_scope_for_uri (const char *uri)
+dl_scope_default_for_uri (const char *uri)
 {
     if (uri && g_hash_table_contains (g_dlrules, uri))
         return DL_SCOPE_PAGE;
@@ -682,7 +741,7 @@ dl_scope_for_uri (const char *uri)
     gboolean site = host && g_hash_table_contains (g_dlrules, host);
     g_free (host);
 
-    return site ? DL_SCOPE_SITE : DL_SCOPE_ALL;
+    return site ? DL_SCOPE_PAGE : DL_SCOPE_ALL;
 }
 
 /* Downloads are often shared with other users or a daemon, so the target
@@ -808,7 +867,6 @@ dl_dir_set (const char *uri, const char *dir, DlScope scope)
 
     g_free (g_download_dir);
     g_download_dir = g_strdup (dir);
-    object_set_string_if_exists (G_OBJECT (g_session), "downloads-directory", g_download_dir);
 }
 
 /* ------------------------------------------------------- search keywords */
@@ -2020,10 +2078,18 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "download_dir"))  { set_str (&g_download_dir, v); return TRUE; }
     if (key_is (k, "profile"))       { set_str (&g_profile, v); return TRUE; }
     if (key_is (k, "user_agent"))    { set_str (&g_user_agent, v); return TRUE; }
+    if (key_is (k, "popups"))        { g_allow_popups = !g_ascii_strcasecmp (v, "allow") || truthy (v); return TRUE; }
     if (key_is (k, "css"))           { set_str (&g_css_owned, v); g_css_path = g_css_owned; return TRUE; }
     if (key_is (k, "zoom"))          { g_zoom = CLAMP (g_ascii_strtod (v, NULL), ZOOM_MIN, ZOOM_MAX); return TRUE; }
     if (key_is (k, "private"))       { g_private = truthy (v); return TRUE; }
     if (key_is (k, "no_media"))      { g_deny_media = truthy (v); return TRUE; }
+    if (key_is (k, "lock")) {
+        if (!g_ascii_strcasecmp (v, "page"))      g_lock_mode = LOCK_PAGE;
+        else if (!g_ascii_strcasecmp (v, "site")) g_lock_mode = LOCK_SITE;
+        else if (!truthy (v))                     g_lock_mode = LOCK_OFF;
+        else g_printerr ("config: lock must be page, site or no\n");
+        return TRUE;
+    }
     if (key_is (k, "quiet"))         { g_quiet = truthy (v); return TRUE; }
     if (key_is (k, "page_title"))    { g_want_page_title = truthy (v); return TRUE; }
     if (key_is (k, "select_all"))    { g_fix_select_all = truthy (v); return TRUE; }
@@ -2287,7 +2353,8 @@ usage (const char *argv0, gboolean to_stdout)
 "  --no-gpu            hardware acceleration policy NEVER\n"
 "  --no-dmabuf         WEBKIT_DISABLE_DMABUF_RENDERER=1\n"
 "  --no-compositing    WEBKIT_DISABLE_COMPOSITING_MODE=1\n"
-"  --no-hw-decode      WEBKIT_GST_ENABLE_HW_DECODERS=0\n"
+"  --no-hw-decode      rank the hardware video decoders out\n"
+"                      (GST_PLUGIN_FEATURE_RANK), so software decodes\n"
 "                      the four to reach for when a machine comes back up\n"
 "                      and pages render blank or zero sized\n"
 "  --enable-middle-click-paste\n"
@@ -2332,6 +2399,9 @@ usage (const char *argv0, gboolean to_stdout)
 "                      what is on disk now, then exit. Follows --profile\n"
 "                      and --private wherever they sit on the line\n"
 "  --user-agent UA     set an explicit user agent string\n"
+"  --allow-popups      let pages open windows without a click (Zoom,\n"
+"                      meeting and login flows that open a tab after a\n"
+"                      server round trip). popups = allow in a config file\n"
 "  --ua-chrome | --ua-win-chrome | --ua-win-edge | --ua-firefox | --ua-safari\n"
 "\n"
 "history:\n"
@@ -2363,8 +2433,9 @@ usage (const char *argv0, gboolean to_stdout)
 "           font font_mono label_px title_px hint_px\n"
 "  ours:    title app_id zoom mod clip_cmd download_dir profile private\n"
 "           no_media page_title middle_click_paste select_all load_bar\n"
+"           lock (page, site or no: stay on the address given)\n"
 "           css\n"
-"           user_agent quiet\n"
+"           user_agent quiet popups (allow: see --allow-popups)\n"
 "           always_overwrite  search_default (which keyword needs no prefix)\n"
 "           gsk (GTK's renderer: gl, cairo, vulkan, ngl)\n"
 "           feature = Name[=on|off] (a WebKit runtime feature; repeatable)\n"
@@ -2399,6 +2470,13 @@ usage (const char *argv0, gboolean to_stdout)
 "                      sampled every 5s and, when it spins at 90%%+ cpu for\n"
 "                      15s, its running and blocked threads are printed -\n"
 "                      the thing to read when a page freezes\n"
+"  --lock-page         show the address given and nothing else: a link, a\n"
+"                      redirect, a script or the address bar leading\n"
+"                      anywhere else is refused, and no second window is\n"
+"                      opened. A fragment counts as the same page\n"
+"  --lock-site         the same, but anything on that host is allowed.\n"
+"                      Use it when a login or a payment step leaves the\n"
+"                      page. lock = page|site in a config file\n"
 "  --no-console        do not print the page's own console output, while\n"
 "                      keeping ours. A page that logs heavily makes the\n"
 "                      web process wait on every message\n"
@@ -2673,6 +2751,10 @@ ui_css_install (void)
         "  color: %s; %s font-size: %.0fpx;"
         "}",
         c_text, ui_font, t->label_px * s);
+
+    /* an error toast: the same panel, the failure colour, and wrapped */
+    g_string_append_printf (css,
+        "label.br-toast.br-toast-error { color: %s; }", c_urgent);
 
     /* URLs and file names: fixed width, so they line up and elide sanely */
     g_string_append_printf (css,
@@ -3230,6 +3312,21 @@ on_decide_policy (WebKitWebView            *view,
             webkit_policy_decision_ignore (decision);
             return TRUE;
         }
+
+        WebKitURIRequest *req = act ? webkit_navigation_action_get_request (act) : NULL;
+        const char       *to  = req ? webkit_uri_request_get_uri (req) : NULL;
+
+        if (!nav_allowed (to)) {
+            Win  *w   = win_for_view (view);
+            char *msg = g_strdup_printf ("locked to %s",
+                                         g_lock_mode == LOCK_SITE ? "this site" : "this page");
+            LOG ("lock: refused %s\n", to ? to : "(no address)");
+            if (w)
+                toast_show (w, msg, 3);
+            g_free (msg);
+            webkit_policy_decision_ignore (decision);
+            return TRUE;
+        }
         return FALSE;
     }
 
@@ -3268,8 +3365,10 @@ static const char *
 perm_type_name (WebKitPermissionRequest *req)
 {
     if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST (req))          return "user-media";
-    if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST (req))         return "device-info";
+    /* 2.54 only declares it when WebKit was built with pointer lock */
+#ifdef WEBKIT_TYPE_POINTER_LOCK_PERMISSION_REQUEST
     if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST (req))        return "pointer-lock";
+#endif
     if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST (req))         return "geolocation";
     if (WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST (req))        return "notification";
     if (WEBKIT_IS_CLIPBOARD_PERMISSION_REQUEST (req))           return "clipboard";
@@ -3346,7 +3445,9 @@ media_spawn (Win *w, const char *cmd, const char *arg, const char *shown)
     int     argc = 0;
 
     if (!g_shell_parse_argv (cmd, &argc, &args, &err)) {
-        g_printerr ("media: cannot parse \"%s\": %s\n", cmd, err->message);
+        char *msg = g_strdup_printf ("media: cannot parse \"%s\": %s", cmd, err->message);
+        toast_error (w, msg);
+        g_free (msg);
         g_clear_error (&err);
         return FALSE;
     }
@@ -3361,13 +3462,14 @@ media_spawn (Win *w, const char *cmd, const char *arg, const char *shown)
                                  G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
                                  NULL, NULL, NULL, &err);
     char *msg = ok ? g_strdup_printf ("%s  %s", args[0], shown)
-                   : g_strdup_printf ("%s: %s", args[0], err->message);
-    if (ok)
+                   : g_strdup_printf ("media: cannot start %s: %s", args[0], err->message);
+    if (ok) {
         LOG ("media: %s %s\n", cmd, arg);
-    else
-        g_printerr ("media: %s: %s\n", cmd, err->message);
-    if (w)
-        toast_show (w, msg, ok ? 2 : URL_TOAST_SECONDS);
+        if (w)
+            toast_show (w, msg, 2);
+    } else {
+        toast_error (w, msg);
+    }
 
     g_free (msg);
     g_clear_error (&err);
@@ -3437,12 +3539,9 @@ on_image_fetched (GObject *src, GAsyncResult *res, gpointer u)
         char *why = err ? g_strdup (err->message)
                   : g_strdup_printf ("HTTP %u, %" G_GSIZE_FORMAT " bytes", code,
                                      body ? g_bytes_get_size (body) : 0);
-        g_printerr ("media: image %s: %s\n", f->uri, why);
-        if (w) {
-            char *t = g_strdup_printf ("image not fetched: %s", why);
-            toast_show (w, t, URL_TOAST_SECONDS);
-            g_free (t);
-        }
+        char *t = g_strdup_printf ("media: image not fetched: %s\n%s", why, f->uri);
+        toast_error (w, t);
+        g_free (t);
         g_free (why);
     } else {
         char *dir  = media_tmp_dir ();
@@ -3453,12 +3552,17 @@ on_image_fetched (GObject *src, GAsyncResult *res, gpointer u)
             const guint8 *p = g_bytes_get_data (body, &n);
             gboolean wrote = write (fd, p, n) == (ssize_t) n;
             close (fd);
-            if (wrote)
+            if (wrote) {
                 media_spawn (w, g_image_viewer, tmpl, f->uri);
-            else
-                g_printerr ("media: cannot write %s\n", tmpl);
+            } else {
+                char *t = g_strdup_printf ("media: cannot write %s", tmpl);
+                toast_error (w, t);
+                g_free (t);
+            }
         } else {
-            g_printerr ("media: cannot create a file in %s\n", dir);
+            char *t = g_strdup_printf ("media: cannot create a file in %s", dir);
+            toast_error (w, t);
+            g_free (t);
         }
         g_free (tmpl);
         g_free (dir);
@@ -3754,33 +3858,60 @@ on_permission (WebKitWebView *view, WebKitPermissionRequest *req, gpointer u)
         return TRUE;
     }
 
-    /*
-     * Device labels for enumerateDevices(). A browser reveals them once
-     * the site has been granted a device, and not before; the same rule
-     * applies here, read from what was remembered.
-     */
-    if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST (req)) {
-        const char *had   = perm_remembered (host);
-        gboolean    allow = g_media_policy == MEDIA_ALLOW ||
-                            (g_media_policy == MEDIA_ASK && had && !strcmp (had, "allow"));
-        LOG ("perm: %s -> %s\n", type, allow ? "allow" : "deny");
-        if (allow)
-            webkit_permission_request_allow (req);
-        else
-            webkit_permission_request_deny (req);
-        g_free (host);
-        return TRUE;
-    }
+    /* Device labels for enumerateDevices() are not decided here: WebKit
+     * 2.54 no longer emits WebKitDeviceInfoPermissionRequest and asks
+     * query-permission-state instead, see on_query_permission(). */
 
+#ifdef WEBKIT_TYPE_POINTER_LOCK_PERMISSION_REQUEST
     if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST (req)) {
         webkit_permission_request_allow (req);
         g_free (host);
         return TRUE;
     }
+#endif
 
     LOG ("perm: %s -> deny\n", type);
     webkit_permission_request_deny (req);
     g_free (host);
+    return TRUE;
+}
+
+/*
+ * navigator.permissions.query({name:'camera'|'microphone'}), and WebKit's
+ * own question before enumerateDevices() and getUserMedia(): is this site
+ * already allowed? Unanswered, WebKit's documented default is "prompt",
+ * so a remembered site would never be told it is allowed and device
+ * labels would stay hidden. Answered from the same per-site memory as the
+ * prompt, keyed by the top-level origin's host.
+ */
+static gboolean
+on_query_permission (WebKitWebView *view, WebKitPermissionStateQuery *q, gpointer u)
+{
+    (void) view; (void) u;
+    const char *name = webkit_permission_state_query_get_name (q);
+
+    if (g_strcmp0 (name, "camera") != 0 && g_strcmp0 (name, "microphone") != 0)
+        return FALSE;                          /* WebKit answers "prompt" */
+
+    WebKitSecurityOrigin *o    = webkit_permission_state_query_get_security_origin (q);
+    const char           *host = o ? webkit_security_origin_get_host (o) : NULL;
+    WebKitPermissionState st;
+
+    if (g_media_policy == MEDIA_ALLOW)
+        st = WEBKIT_PERMISSION_STATE_GRANTED;
+    else if (g_media_policy == MEDIA_DENY)
+        st = WEBKIT_PERMISSION_STATE_DENIED;
+    else {
+        const char *had = perm_remembered (host);
+        if (!had)
+            return FALSE;
+        st = !strcmp (had, "allow") ? WEBKIT_PERMISSION_STATE_GRANTED
+                                    : WEBKIT_PERMISSION_STATE_DENIED;
+    }
+
+    LOG ("perm: query %s for %s -> %s\n", name, host ? host : "?",
+         st == WEBKIT_PERMISSION_STATE_GRANTED ? "granted" : "denied");
+    webkit_permission_state_query_finish (q, st);
     return TRUE;
 }
 
@@ -4656,11 +4787,12 @@ omni_setup_scope (Win *w, OmniMode mode, const char *uri)
     GtkStringList *list = gtk_string_list_new (items);
 
     gtk_drop_down_set_model (GTK_DROP_DOWN (w->omniscope), G_LIST_MODEL (list));
-    gtk_drop_down_set_selected (GTK_DROP_DOWN (w->omniscope), dl_scope_for_uri (uri));
+    DlScope now = dl_scope_default_for_uri (uri);
+
+    gtk_drop_down_set_selected (GTK_DROP_DOWN (w->omniscope), now);
     gtk_widget_set_visible (w->omniscope, TRUE);
 
     /* the same select decides how far this reaches */
-    DlScope now = dl_scope_for_uri (uri);
     char   *key = now == DL_SCOPE_PAGE ? g_strdup (uri)
                 : now == DL_SCOPE_SITE ? uri_host (uri)
                                        : NULL;
@@ -4688,6 +4820,17 @@ omni_show (Win *w, OmniMode mode)
     g_clear_pointer (&w->omni_needle, g_free);
     w->omni_needle = g_strdup ("");
     w->omni_mode   = mode;
+
+    /* The download-directory clash question hides the input and turns the
+     * hint into its question. Whatever way it was left - answered, Esc, a
+     * click outside - the next popup starts from the ordinary layout, and
+     * an unanswered question is dropped rather than answered later. */
+    w->dl_conflict = FALSE;
+    g_clear_pointer (&w->dl_pending_dir, g_free);
+    gtk_widget_set_visible (w->omnientry, TRUE);
+    gtk_label_set_wrap (GTK_LABEL (w->omnihint), FALSE);
+    gtk_widget_set_hexpand (w->omnihint, FALSE);
+    gtk_widget_set_halign (w->omnihint, GTK_ALIGN_END);
 
     w->omni_setting = TRUE;
     gtk_editable_set_text (GTK_EDITABLE (w->omnientry),
@@ -4984,7 +5127,10 @@ omni_apply_dldir (Win *w)
                   : g_strdup_printf ("%u rules already go there.  Enter drops them,  Esc keeps all.", users->len);
 
         gtk_label_set_text (GTK_LABEL (w->omnihint), ask);
-        gtk_widget_set_halign (w->omnihint, GTK_ALIGN_START);
+        gtk_label_set_wrap (GTK_LABEL (w->omnihint), TRUE);
+        gtk_label_set_xalign (GTK_LABEL (w->omnihint), 0.0);
+        gtk_widget_set_hexpand (w->omnihint, TRUE);
+        gtk_widget_set_halign (w->omnihint, GTK_ALIGN_FILL);
         gtk_widget_set_visible (w->omnihint, TRUE);
         gtk_widget_set_visible (w->omnientry, FALSE);
         gtk_widget_set_visible (w->omniscope, FALSE);
@@ -5111,6 +5257,8 @@ toast_single_line (Win *w)
     GtkLabel *l = GTK_LABEL (w->toast);
 
     gtk_widget_remove_css_class (w->toast, "br-toast-url");
+    gtk_widget_remove_css_class (w->toast, "br-toast-error");
+    w->error_until_us = 0;
     gtk_label_set_wrap (l, FALSE);
     gtk_label_set_lines (l, -1);
     gtk_label_set_ellipsize (l, PANGO_ELLIPSIZE_MIDDLE);
@@ -5127,6 +5275,41 @@ toast_show (Win *w, const char *text, guint seconds)
     if (w->toast_id)
         g_source_remove (w->toast_id);
     w->toast_id = g_timeout_add_seconds (seconds, toast_timeout, w);
+}
+
+/*
+ * Something the user asked for did not happen. A message that is cut in
+ * the middle, gone in four seconds or faded under the pointer is no
+ * message at all, so this one is wrapped whole, in the failure colour,
+ * stays up for ERROR_TOAST_SECONDS, does not fade, and always goes to
+ * stderr as well - -q or not.
+ */
+#define ERROR_TOAST_SECONDS 10
+
+void
+toast_error (Win *w, const char *text)
+{
+    g_printerr ("error: %s\n", text);
+    if (!w)
+        return;
+
+    GtkLabel *l = GTK_LABEL (w->toast);
+
+    toast_single_line (w);
+    gtk_widget_add_css_class (w->toast, "br-toast-error");
+    gtk_label_set_ellipsize (l, PANGO_ELLIPSIZE_NONE);
+    gtk_label_set_wrap (l, TRUE);
+    gtk_label_set_wrap_mode (l, PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_max_width_chars (l, 60);
+    gtk_label_set_xalign (l, 0.0);
+    gtk_label_set_text (l, text);
+    gtk_widget_set_opacity (w->topright, 1.0);
+    gtk_widget_set_visible (w->toast, TRUE);
+    w->error_until_us = g_get_monotonic_time () + (gint64) ERROR_TOAST_SECONDS * G_USEC_PER_SEC;
+
+    if (w->toast_id)
+        g_source_remove (w->toast_id);
+    w->toast_id = g_timeout_add_seconds (ERROR_TOAST_SECONDS, toast_timeout, w);
 }
 /*
  * <mod>+P: the whole address. It is wrapped at any character, in the mono
@@ -5534,7 +5717,9 @@ overlay_hover_update (Win *w, double x, double y)
                        g_get_monotonic_time () - w->dl_reveal_us
                        < (gint64) DL_REVEAL_MS * 1000;
 
-    fade_if_under (w, w->topright, x, y, keep_dl);
+    gboolean keep_err = w->error_until_us && g_get_monotonic_time () < w->error_until_us;
+
+    fade_if_under (w, w->topright, x, y, keep_dl || keep_err);
     fade_if_under (w, w->urltoast, x, y, FALSE);
 }
 
@@ -6172,8 +6357,16 @@ static void
 media_mode_toggle (Win *w)
 {
     if ((!g_player || !*g_player) && (!g_image_viewer || !*g_image_viewer)) {
-        toast_show (w, "media mode needs player = mpv and/or image_viewer = imv "
-                       "in the config", URL_TOAST_SECONDS);
+        char *cfg = g_build_filename (g_get_user_config_dir (), g_app->default_app_id,
+                                      "config", NULL);
+        char *msg = g_strdup_printf ("F2 media mode: no player or image viewer is set.\n"
+                                     "Add to %s:\n"
+                                     "    player = mpv\n"
+                                     "    image_viewer = imv\n"
+                                     "or start with --player mpv", cfg);
+        toast_error (w, msg);
+        g_free (msg);
+        g_free (cfg);
         return;
     }
 
@@ -7045,6 +7238,7 @@ view_wire (WebKitWebView *view)
      * session, not on the web view - it is wired up once in browser_main(). */
     g_signal_connect (view, "decide-policy",      G_CALLBACK (on_decide_policy), NULL);
     g_signal_connect (view, "permission-request", G_CALLBACK (on_permission), NULL);
+    g_signal_connect (view, "query-permission-state", G_CALLBACK (on_query_permission), NULL);
     g_signal_connect (view, "create",             G_CALLBACK (on_create), NULL);
     g_signal_connect (view, "load-changed",       G_CALLBACK (on_load_core), NULL);
     g_signal_connect (view, "load-failed",        G_CALLBACK (on_load_failed_core), NULL);
@@ -7094,6 +7288,12 @@ static GtkWidget *
 on_create (WebKitWebView *view, WebKitNavigationAction *act, gpointer u)
 {
     (void) act; (void) u;
+
+    /* A second window would be a way around the lock, so there is none. */
+    if (g_lock_mode != LOCK_OFF) {
+        LOG ("lock: refused a new window\n");
+        return NULL;
+    }
 
     /* popups (SSO, OAuth, "open in new window" players) share the session */
     WebKitWebView *nv = view_new (view);
@@ -7158,13 +7358,6 @@ setup_settings (void)
     /* best effort at behaving like a mainstream browser */
     webkit_settings_set_enable_site_specific_quirks (g_settings, TRUE);
 
-    /* Cloudflare/Turnstile sometimes correlates missing GPU features with bots */
-    settings_set_bool_if_exists (g_settings, "enable-webgl", TRUE);
-    settings_set_bool_if_exists (g_settings, "enable-accelerated-2d-canvas", TRUE);
-
-    /* lets a player pick a codec the build actually has, instead of
-     * negotiating one it cannot decode and then stalling */
-    settings_set_bool_if_exists (g_settings, "enable-media-capabilities", TRUE);
 
     if (g_user_agent && *g_user_agent) {
         webkit_settings_set_user_agent (g_settings, g_user_agent);
@@ -7176,6 +7369,12 @@ setup_settings (void)
      * --no-devtools */
     webkit_settings_set_enable_developer_extras                 (g_settings, !g_no_devtools);
     webkit_settings_set_enable_media_stream                     (g_settings, TRUE);
+    /* Off, WebKit returns null from a window.open that no click started
+     * - and a click stops counting once the page has waited on a fetch.
+     * Zoom opens its meeting tab exactly that way. */
+    webkit_settings_set_javascript_can_open_windows_automatically (g_settings, g_allow_popups);
+    if (g_allow_popups)
+        LOG ("popups: pages may open windows without a click\n");
     webkit_settings_set_enable_webrtc                           (g_settings, TRUE);
     webkit_settings_set_enable_mediasource                      (g_settings, TRUE);
     webkit_settings_set_enable_encrypted_media                  (g_settings, TRUE);
@@ -7488,7 +7687,8 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             cfg_set ("player_match", argv[++i]);
         } else if (!strcmp (a, "--zoom")) {
             NEED_ARG ("--zoom");
-            g_zoom = CLAMP (g_ascii_strtod (argv[++i], NULL), ZOOM_MIN, ZOOM_MAX);
+            const char *zv = argv[++i];
+            g_zoom = CLAMP (g_ascii_strtod (zv, NULL), ZOOM_MIN, ZOOM_MAX);
         } else if (!strcmp (a, "--css")) {
             NEED_ARG ("--css");
             g_css_path = argv[++i];
@@ -7529,6 +7729,10 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             g_gsk_renderer = argv[++i];
         } else if (!strcmp (a, "--no-proc-watch")) {
             g_proc_watch = FALSE;
+        } else if (!strcmp (a, "--lock-page")) {
+            g_lock_mode = LOCK_PAGE;
+        } else if (!strcmp (a, "--lock-site")) {
+            g_lock_mode = LOCK_SITE;
         } else if (!strcmp (a, "--no-console")) {
             g_no_console = TRUE;
         } else if (!strcmp (a, "--all-messages")) {
@@ -7559,6 +7763,8 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             g_profile = g_strdup (argv[++i]);
         } else if (!strcmp (a, "--clear-data")) {
             g_clear_data = TRUE;
+        } else if (!strcmp (a, "--allow-popups")) {
+            g_allow_popups = TRUE;
         } else if (!strcmp (a, "--user-agent")) {
             NEED_ARG ("--user-agent");
             g_free (g_user_agent);
@@ -7598,6 +7804,13 @@ browser_main (int argc, char **argv, const BrowserApp *app)
         }
     }
 #undef NEED_ARG
+
+    /* Locking needs something to lock to, and saying so before the
+     * window is built is cheaper than after it. */
+    if (g_lock_mode != LOCK_OFF && !url_arg) {
+        g_printerr ("%s: --lock-page/--lock-site needs an address to stay on\n", argv[0]);
+        return 1;
+    }
 
     /* The page <title> drives the window title by default. An explicit
      * --title pins it instead, unless --page-title is also given - then
@@ -7681,7 +7894,17 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     }
     if (g_no_dmabuf)      g_setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     if (g_no_compositing) g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
-    if (g_no_hw_decode)   g_setenv ("WEBKIT_GST_ENABLE_HW_DECODERS", "0", TRUE);
+    /* WebKitGTK 2.54 has no switch of its own for this (the old
+     * WEBKIT_GST_ENABLE_HW_DECODERS is gone). GStreamer's documented way
+     * is the feature rank: a decoder at NONE is never autoplugged. */
+    if (g_no_hw_decode)
+        gst_rank_env_add ("vah264dec:NONE,vah265dec:NONE,vavp8dec:NONE,vavp9dec:NONE,"
+                          "vaav1dec:NONE,vampeg2dec:NONE,vajpegdec:NONE,"
+                          "vaapih264dec:NONE,vaapih265dec:NONE,vaapivp8dec:NONE,"
+                          "vaapivp9dec:NONE,vaapiav1dec:NONE,vaapidecodebin:NONE,"
+                          "v4l2slh264dec:NONE,v4l2slh265dec:NONE,v4l2slvp8dec:NONE,"
+                          "v4l2slvp9dec:NONE,v4l2slav1dec:NONE,v4l2h264dec:NONE,"
+                          "v4l2h265dec:NONE,v4l2vp8dec:NONE,v4l2vp9dec:NONE");
 
     if (app->pre_gtk)
         app->pre_gtk ();
@@ -7709,7 +7932,6 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     setup_session ();
     g_signal_connect (g_session, "download-started",
                       G_CALLBACK (on_session_download_started), NULL);
-    object_set_string_if_exists (G_OBJECT (g_session), "downloads-directory", g_download_dir);
 
     history_setup (g_data_dir);
     dlrules_setup (g_data_dir);      /* app wide; the profile is only migrated from */
@@ -7750,16 +7972,31 @@ browser_main (int argc, char **argv, const BrowserApp *app)
         gtk_window_present (GTK_WINDOW (win));
     } else {
         /* the front-end may claim the address, e.g. browser-big's "diag" */
-        if (!(app->load_uri && app->load_uri (view, url_arg))) {
-            char *url = normalize_uri (url_arg);
+        char *url = normalize_uri (url_arg);
+
+        /* The lock is measured against the address as given, before the
+         * front-end gets a chance to serve something of its own. */
+        if (g_lock_mode != LOCK_OFF) {
             if (!url) {
                 usage_short (argv[0]);
+                noise_drain ();
+                return 1;
+            }
+            g_lock_uri = g_strdup (url);
+            LOG ("lock: %s only (%s)\n",
+                 g_lock_mode == LOCK_SITE ? "this site" : "this page", g_lock_uri);
+        }
+
+        if (!(app->load_uri && app->load_uri (view, url_arg))) {
+            if (!url) {
+                usage_short (argv[0]);
+                noise_drain ();
                 return 1;
             }
             LOG ("load: %s\n", url);
             webkit_web_view_load_uri (view, url);
-            g_free (url);
         }
+        g_free (url);
         gtk_window_present (GTK_WINDOW (win));
     }
 
@@ -7781,6 +8018,7 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     g_free (g_profile);
     g_free (g_user_agent);
     g_free (g_css_owned);
+    g_free (g_lock_uri);
     g_free (g_theme.font);
     g_free (g_theme.font_mono);
     return 0;

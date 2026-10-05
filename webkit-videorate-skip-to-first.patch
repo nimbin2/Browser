@@ -1,0 +1,13 @@
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCapturer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoCapturer.cpp
+@@ -135,6 +135,10 @@
+ 
+     auto* bin = gst_bin_new(nullptr);
+     auto* videorate = makeGStreamerElement("videorate"_s, "videorate"_s);
++    // The capture pipeline runs with base time 0, so buffer PTS are absolute
++    // CLOCK_MONOTONIC values. Without skip-to-first, videorate fills the gap
++    // from segment start with uptime x fps duplicate frames (WebKit PR 74373).
++    g_object_set(videorate, "skip-to-first", TRUE, nullptr);
+ 
+     // The workaround below doesn't seem necessary anymore in GStreamer 1.28 and beyond.
+     // Fixed by: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/commit/6f623af4d745efaacd0c8639b99536def4a65c78
