@@ -61,6 +61,7 @@ typedef struct {
     guint          dl_history_id;
     gboolean       primary;
     gint64         dl_reveal_us;  /* a download just appeared; do not fade   */
+    gint64         error_until_us; /* an error toast is up; do not fade      */
 
     /* stored-history walk, see history.c section in browser_core.c */
     gboolean       hist_walk;    /* past the end of the session list       */
@@ -104,7 +105,10 @@ typedef struct {
     void     (*usage_options) (GString *out);   /* extra option sections  */
     void     (*usage_keys)    (GString *out);   /* extra key bindings     */
 
-    /* Return TRUE if argv[*i] was consumed; advance *i over its value. */
+    /* Return TRUE if argv[*i] was consumed; advance *i over its value.
+     * Read that value into a local first: MAX/MIN/CLAMP are macros that
+     * evaluate their arguments more than once, so MAX (0, atoi (argv[++(*i)]))
+     * advances *i twice and swallows the next option's value. */
     gboolean (*parse_arg)     (int argc, char **argv, int *i);
 
     void     (*pre_gtk)       (void);           /* env, before gtk_init() */
@@ -168,10 +172,11 @@ extern const char     *g_mod_name;
 
 Win  *win_of    (WebKitWebView *view);
 void  toast_show (Win *w, const char *text, guint seconds);
+void  toast_error (Win *w, const char *text);   /* red, wrapped, 10 s, also stderr */
 void  css_reload (void);
 void  view_eval  (WebKitWebView *view, const char *js);
 char *normalize_uri (const char *in);
-void  settings_set_bool_if_exists (WebKitSettings *s, const char *prop, gboolean value);
-void  object_set_string_if_exists (GObject *o, const char *prop, const char *value);
+void  gst_rank_env_add (const char *spec);   /* append to GST_PLUGIN_FEATURE_RANK */
+void  feature_request  (const char *spec);   /* --feature NAME[=on|off], from a front-end */
 
 #endif /* BROWSER_CORE_H */

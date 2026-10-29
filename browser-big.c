@@ -42,7 +42,7 @@ static gboolean g_capture_started;   /* something actually began capturing */
 static guint    g_capture_watch;
 
 /* camera / media behaviour */
-static gboolean g_cam_fix;                 /* install the getUserMedia shim */
+static gboolean g_cam_fix = TRUE;          /* install the shim (--no-cam-fix: nothing) */
 /*
  * The shim carries more than camera repairs: --rtc-trace, --web-compat,
  * --no-mic and the offer fixes all ride in it. Installing it must not
@@ -58,18 +58,17 @@ static int      g_cam_retries   = 3;
 static int      g_cam_max_w     = 1280;
 static int      g_cam_max_h     = 720;
 static int      g_cam_max_fps   = 30;
-static int      g_cam_force_w, g_cam_force_h, g_cam_force_fps;
-static gboolean g_cam_force_exact;
 static gboolean g_no_mic;                  /* --no-mic diagnostic */
 static gboolean g_web_compat;              /* fill in APIs WebKit lacks */
-static gboolean g_cam_scale;
-static int      g_cam_scale_fps = 15;      /* ceiling for the scaled output */               /* give the page the size it asked */
-static gboolean g_rtc_params_fix;          /* fill in the required codecs */
+static gboolean g_rtc_params_fix = TRUE;   /* fill in the required codecs */
 static gboolean g_rtc_trace;               /* report each WebRTC step */
-static gboolean g_sdp_ssrc_fix;            /* add the missing a=ssrc cname */
+static gboolean g_sdp_ssrc_fix = TRUE;     /* a=ssrc lines, real SSRC and pt */
+static gboolean g_silent_split = TRUE;     /* play video while its audio is silent */
+static gboolean g_fps_loose = TRUE;        /* cam_size_fix: let the size pick the mode */
 static char    *g_video_codecs;            /* preferred order, e.g. "VP8" */
-static int      g_cam_hold_ms = 3000;      /* how long a shared capture lingers */
+static gboolean g_codecs_set;              /* given explicitly; unset = VP8 */
 static char    *g_cam_match;               /* prefer this camera label */
+static char    *g_mic_match;               /* prefer this microphone label */
 static gboolean g_prewarm;                 /* probe capture devices at startup */
 static gboolean g_warm_cam;                /* open the camera before page one */
 static int      g_warm_timeout  = 10;
@@ -89,6 +88,8 @@ static gboolean g_first_load_done;
 static gboolean    g_no_webrtc, g_no_mediastream;
 static const char *g_gst_debug, *g_gst_dbgfile, *g_webkit_dbg;
 static char       *g_gst_rank;             /* GST_PLUGIN_FEATURE_RANK, accumulated */
+static gboolean    g_audio_alsa;           /* audio = alsa / --audio-alsa */
+static gboolean    g_ice_libnice = TRUE;   /* ice = rice / --ice-rice to undo */
 
 static void
 gst_rank_add (const char *spec)
@@ -123,6 +124,8 @@ typedef struct {
 static void load_diag_page (WebKitWebView *view);
 static gboolean g_list_cameras;
 static void cam_list (void);
+static void set_video_codecs (const char *v);
+static void set_fix_webrtc (gboolean on);
 
 /* Wall-clock stamp, so the UI process, the web process and GStreamer logs
  * can be lined up against each other. */
@@ -153,6 +156,53 @@ mlog (const char *fmt, ...)
 
     g_printerr ("[%s] %s\n", ts, msg);
     g_free (msg);
+}
+
+/*
+ * GStreamer 1.28 starts the device providers asynchronously:
+ * gst_device_monitor_start() returns before any provider has probed, and
+ * GST_MESSAGE_DEVICE_MONITOR_STARTED is posted on the monitor's bus once
+ * the initial device list exists. Asking for the devices before that
+ * message yields an empty or partial list. WebKit waits for it, so we do
+ * too - with a deadline, since we are a diagnostic and must not hang.
+ */
+#if !GST_CHECK_VERSION (1, 28, 0)
+#define GST_MESSAGE_DEVICE_MONITOR_STARTED ((GstMessageType) (GST_MESSAGE_EXTENDED + 9))
+#endif
+
+static gboolean
+device_monitor_wait_started (GstDeviceMonitor *mon, guint timeout_ms)
+{
+    guint maj = 0, min = 0, mic = 0, nano = 0;
+    gst_version (&maj, &min, &mic, &nano);
+    if (maj < 1 || (maj == 1 && min < 28))
+        return TRUE;                   /* older: providers started synchronously */
+
+    GstBus  *bus      = gst_device_monitor_get_bus (mon);
+    gint64   deadline = g_get_monotonic_time () + (gint64) timeout_ms * 1000;
+    gboolean started  = FALSE;
+
+    for (;;) {
+        gint64 left = deadline - g_get_monotonic_time ();
+        if (left <= 0)
+            break;
+        GstMessage *m = gst_bus_timed_pop_filtered (bus, (GstClockTime) left * 1000,
+                                                    GST_MESSAGE_EXTENDED);
+        if (!m)
+            break;
+        if (GST_MESSAGE_TYPE (m) == GST_MESSAGE_DEVICE_MONITOR_STARTED) {
+            const GstStructure *st = gst_message_get_structure (m);
+            gboolean ok = TRUE;
+            if (st)
+                gst_structure_get_boolean (st, "success", &ok);
+            started = ok;
+            gst_message_unref (m);
+            break;
+        }
+        gst_message_unref (m);
+    }
+    gst_object_unref (bus);
+    return started;
 }
 
 static gboolean
@@ -197,12 +247,15 @@ parse_cam_max (const char *spec)
  *  2. retries with progressively looser constraints instead of handing the
  *     page a NotReadableError it will usually turn into a permanent failure.
  *
- *  3. keeps the acquired tracks and hands the page *clones*. The page can
- *     stop its clone (leave a call, switch view) without closing the device,
- *     so the next getUserMedia() resolves in milliseconds instead of seconds.
+ *  3. keeps the acquired tracks and hands a repeated request the same live
+ *     track, counting the hand-outs so stop() only closes the device when
+ *     the last user lets go (--cam-share).
  *
  *  4. watches <video>/<audio> for playback that has stopped advancing and
  *     tries play() -> seek -> load() -> reload before giving up.
+ *
+ *  5. carries the WebRTC repairs (SDP, SSRC, payload type, codec order,
+ *     silent-audio split) and the --rtc-trace instrumentation.
  *
  * Configuration arrives as window.__bbCfg, built in main().
  */
@@ -262,8 +315,8 @@ static const char *SHIM_JS =
 "if(!C.camfix||!md||!md.getUserMedia){post({ev:'shim',camfix:false});return;}"
 "var origGUM=md.getUserMedia.bind(md);"
 "var origEnum=md.enumerateDevices?md.enumerateDevices.bind(md):null;"
-"var cachedV=null,cachedA=null,pinned=null,pinTried=false;"
-"var served=[],lastServe=0,lastDevices='';"
+"var cachedV=null,cachedA=null,pinned=null,pinnedA=null,pinTried=false;"
+"var lastDevices='';"
 "function now(){return (window.performance&&performance.now)?performance.now():Date.now();}"
 "function safe(o){try{return JSON.parse(JSON.stringify(o));}catch(e){return String(o);}}"
 "function num(v){if(v==null)return null;if(typeof v==='number')return v;"
@@ -298,9 +351,37 @@ static const char *SHIM_JS =
 "  if(level>=2&&o.audio&&typeof o.audio==='object')o.audio=true;"
 "  return o;"
 "}"
-/* --cam-force: the size and shape are ours, whatever the page asked. */
 /* --no-mic: the page gets no microphone, whatever it asked. A diagnostic:
  * if a freeze disappears, the audio path is the cause. */
+/*
+ * WebKit only considers camera modes whose frame rate list contains the
+ * requested rate exactly (RealtimeVideoCaptureSource::presetSupportsFrameRate).
+ * A page asking frameRate {max: 20} therefore skips a 320x240 mode that
+ * only runs at 30 and lands on the one 16:9 mode that lists 20 -
+ * letterboxed instead of the 4:3 it asked for. Chrome takes the native mode
+ * and drops frames. A soft limit (ideal or max) is left out here so the
+ * size decides; exact and min are kept. (The 4:3 modes also need the WebKit
+ * caps-normalize patch, see HANDOVER.md.)
+ */
+"function looseFps(c){"
+"  if(!C.fpsLoose||!c||!c.video||typeof c.video!=='object'||c.video.frameRate==null)return c;"
+"  var f=c.video.frameRate;"
+"  if(typeof f==='object'&&(f.exact!=null||f.min!=null))return c;"
+"  var o={},nv={},k;"
+"  for(k in c)o[k]=c[k];"
+"  for(k in c.video)if(k!=='frameRate')nv[k]=c.video[k];"
+"  o.video=nv;"
+"  post({ev:'gum-fps-loosened',was:f});"
+"  return o;"
+"}"
+"if(C.fpsLoose&&window.MediaStreamTrack&&MediaStreamTrack.prototype.applyConstraints){(function(){"
+"  var oAC=MediaStreamTrack.prototype.applyConstraints;"
+"  MediaStreamTrack.prototype.applyConstraints=function(c){"
+"    if(this.kind==='video'&&c&&typeof c==='object'&&c.frameRate!=null)"
+"      c=looseFps({video:c}).video;"
+"    return oAC.call(this,c);"
+"  };"
+"})();}"
 "function withoutMic(c){"
 "  if(!C.noMic||!c||!c.audio)return c;"
 "  var o={},k;for(k in c)o[k]=c[k];"
@@ -309,38 +390,43 @@ static const char *SHIM_JS =
 "  post({ev:'gum-nomic'});"
 "  return o;"
 "}"
-"function withForce(c){"
-"  if(!C.forceW||!c||!c.video)return c;"
-"  var o={},k;for(k in c)o[k]=c[k];"
-"  var v=(o.video===true||typeof o.video!=='object')?{}:o.video;"
-"  var nv={};for(k in v)nv[k]=v[k];"
-"  var k2=C.forceExact?'exact':'ideal',w={},h={},ar={},fr={};"
-"  w[k2]=C.forceW;h[k2]=C.forceH;ar[k2]=C.forceW/C.forceH;"
-"  nv.width=w;nv.height=h;nv.aspectRatio=ar;"
-"  if(C.forceFps){fr[k2]=C.forceFps;nv.frameRate=fr;}"
-"  o.video=nv;return o;"
+"function pinKind(o,kind,id){"
+"  if(!id||!o[kind])return;"
+"  var v=(o[kind]===true||typeof o[kind]!=='object')?{}:o[kind];"
+"  var nv={},k;for(k in v)nv[k]=v[k];"
+"  if(kind==='audio'&&C.micMatch)nv.deviceId={exact:id};"
+"  else if(!nv.deviceId)nv.deviceId={ideal:id};"
+"  o[kind]=nv;"
 "}"
 "function withPin(c){"
-"  if(!pinned||!c||!c.video)return c;"
+"  if((!pinned&&!pinnedA)||!c)return c;"
 "  var o={},k;for(k in c)o[k]=c[k];"
-"  var v=(o.video===true||typeof o.video!=='object')?{}:o.video;"
-"  var nv={};for(k in v)nv[k]=v[k];"
-"  if(!nv.deviceId)nv.deviceId={ideal:pinned};"
-"  o.video=nv;return o;"
+"  pinKind(o,'video',pinned);pinKind(o,'audio',pinnedA);"
+"  return o;"
 "}"
 "function pinDevice(){"
-"  if(pinTried||!C.match||!origEnum)return Promise.resolve(null);"
-"  pinTried=true;"
+"  if(pinTried||(!C.match&&!C.micMatch)||!origEnum)return Promise.resolve(null);"
 "  return origEnum().then(function(l){"
-"    var m=C.match.toLowerCase();"
-"    for(var i=0;i<l.length;i++)"
-"      if(l[i].kind==='videoinput'&&(l[i].label||'').toLowerCase().indexOf(m)>=0){pinned=l[i].deviceId;break;}"
-"    post({ev:'cam-pin',match:C.match,found:!!pinned});return pinned;"
+/* Before the first grant in a document the labels are empty, so there is
+ * nothing to match yet: try again once a stream has been handed out. */
+"    if(!l.some(function(d){return d.label;}))return null;"
+"    pinTried=true;"
+"    function find(kind,m){m=m.toLowerCase();"
+"      for(var i=0;i<l.length;i++)"
+"        if(l[i].kind===kind&&(l[i].label||'').toLowerCase().indexOf(m)>=0)return l[i].deviceId;"
+"      return null;}"
+"    if(C.match){pinned=find('videoinput',C.match);"
+"      post({ev:'cam-pin',match:C.match,found:!!pinned});}"
+"    if(C.micMatch){pinnedA=find('audioinput',C.micMatch);"
+"      post({ev:'mic-pin',match:C.micMatch,found:!!pinnedA,"
+"            have:l.filter(function(d){return d.kind==='audioinput';}).map(function(d){return d.label;})});}"
+"    return pinned;"
 "  }).catch(function(){return null;});"
 "}"
 "function dumpTrack(t){"
 "  var s={};try{s=t.getSettings?t.getSettings():{};}catch(e){}"
-"  post({ev:'track',kind:t.kind,label:t.label,readyState:t.readyState,settings:s});"
+"  post({ev:'track',kind:t.kind,id:t.id,label:t.label,"
+"        readyState:t.readyState,muted:!!t.muted,settings:s});"
 "}"
 "function wants(c,k){return !!(c&&c[k]);}"
 "function deviceOk(track,c){"
@@ -349,138 +435,54 @@ static const char *SHIM_JS =
 "  if(typeof want!=='string')return true;"
 "  try{return track.getSettings().deviceId===want;}catch(e){return true;}"
 "}"
+/*
+ * Handing the page the same track it already has, rather than a clone.
+ * A clone is an independent track over one capture in the specification;
+ * on WebKitGTK 2.52 it goes black about a second after it is handed over
+ * and the encoder never sees a frame. The track itself does not.
+ *
+ * The one thing a clone bought was an independent lifetime, so the page
+ * dropping its first stream did not close the capture. That is kept by
+ * counting the hand-outs and swallowing stop() until the last one.
+ */
+"var shareRefs=0,realStop=null;"
+"function shareTrack(t){"
+"  if(!t)return t;"
+"  if(!realStop){"
+"    realStop=t.stop.bind(t);"
+"    t.stop=function(){"
+"      shareRefs--;"
+"      if(shareRefs>0){post({ev:'cam-share-hold',refs:shareRefs});return;}"
+"      post({ev:'cam-share-stop'});realStop();"
+"    };"
+"  }"
+"  shareRefs++;"
+"  return t;"
+"}"
 "function serve(c){"
 "  if(!C.cache)return null;"
 "  var out=new MediaStream(),ok=true;"
 "  if(wants(c,'video')){"
 "    if(cachedV&&cachedV.readyState==='live'&&deviceOk(cachedV,c)){"
-"      var v=cachedV.clone();"
-/* honour what the page asked for unless relaxing was requested */
-"      if(typeof c.video==='object')try{"
-"        v.applyConstraints(C.relax?relaxVideo(c.video,1):c.video).catch(function(){});"
-"      }catch(e){}"
-"      out.addTrack(v);"
+"      out.addTrack(shareTrack(cachedV));"
 "    }else ok=false;"
 "  }"
 "  if(wants(c,'audio')){"
-"    if(cachedA&&cachedA.readyState==='live')out.addTrack(cachedA.clone());else ok=false;"
+"    if(cachedA&&cachedA.readyState==='live')"
+"      out.addTrack(cachedA);"
+"    else ok=false;"
 "  }"
 "  return (ok&&out.getTracks().length)?note(out):null;"
 "}"
-/* Remember the clones handed to the page, so we can tell when they have
- * all finished and the held source is no longer doing anybody any good. */
-"function note(st){"
-"  lastServe=now();"
-"  st.getTracks().forEach(function(t){served.push(t);});"
-"  return st;"
-"}"
-"function anyLive(){"
-"  served=served.filter(function(t){return t.readyState==='live';});"
-"  return served.length>0;"
-"}"
+"function note(st){return st;}"
 "function keep(st){"
 "  if(!C.cache)return st;"
 "  var v=st.getVideoTracks()[0],a=st.getAudioTracks()[0];"
 "  if(v)cachedV=v;if(a)cachedA=a;"
-"  var out=new MediaStream();"
-"  if(v)out.addTrack(v.clone());"
-"  if(a)out.addTrack(a.clone());"
-"  return out.getTracks().length?note(out):st;"
+"  if(v)shareTrack(v);"
+"  return note(st);"
 "}"
 /* Which requested kind the browser has no device for, if any. */
-/*
- * WebKit does not scale a capture: asked for 320x240 it picks the nearest
- * native camera mode and hands that over instead, so a site that needs
- * the size it asked for gets a stream it rejects. Chrome scales. This does
- * the same, by drawing the camera into a canvas of the requested size and
- * capturing that.
- */
-"function scaleStream(st,c){"
-"  if(!C.scale||!st){return Promise.resolve(st);}"
-"  var wv=(c&&typeof c.video==='object')?c.video:null;"
-"  var wantW=wv?num(wv.width):null,wantH=wv?num(wv.height):null,"
-"      wantF=wv?num(wv.frameRate):null;"
-"  var vt=st.getVideoTracks()[0];"
-"  if(!wantW||!wantH||!vt){"
-"    post({ev:'cam-scale-skip',why:!vt?'no video track':'no size asked'});"
-"    return Promise.resolve(st);}"
-"  var s={};try{s=vt.getSettings?vt.getSettings():{};}catch(e){}"
-"  if(s.width===wantW&&s.height===wantH){"
-"    post({ev:'cam-scale-skip',why:'already the right size'});"
-"    return Promise.resolve(st);}"
-"  try{"
-"    var v=document.createElement('video');"
-"    v.muted=true;v.defaultMuted=true;v.autoplay=true;v.playsInline=true;"
-"    v.setAttribute('playsinline','');"
-/* It has to be in the document, and not display:none, or some engines
- * never produce frames to draw from. Parked off-screen instead. */
-"    v.style.cssText='position:fixed;left:-10000px;top:0;width:4px;height:4px;"
-"opacity:0;pointer-events:none';"
-"    (document.body||document.documentElement).appendChild(v);"
-"    v.srcObject=new MediaStream([vt]);"
-"    var cv=document.createElement('canvas');"
-"    cv.width=wantW;cv.height=wantH;"
-"    var ctx=cv.getContext('2d');"
-"    if(!cv.captureStream){"
-"      post({ev:'cam-scale-error',why:'no captureStream'});"
-"      return Promise.resolve(st);}"
-"    var fps=Math.min(wantF||C.scaleFps||15,C.scaleFps||15);"
-/* play() is fired and not awaited: if it never settles the page's own
- * getUserMedia would hang forever, which is worse than a late first frame. */
-"    try{var p=v.play();if(p&&p.catch)p.catch(function(){});}catch(e){}"
-"    return new Promise(function(resolve){"
-"      var done=false;"
-"      function go(){"
-"        if(done)return;done=true;"
-/*
- * Drawing on a timer burns CPU whether or not a new frame arrived, and
- * this runs on the page's own main thread - enough to freeze a heavy
- * conference app that is already software-rendering. requestVideoFrameCallback
- * fires once per actual frame, which is both cheaper and in step.
- */
-"        var stopped=false;"
-"        function draw(){"
-"          try{if(v.videoWidth)ctx.drawImage(v,0,0,cv.width,cv.height);}catch(e){}"
-"        }"
-"        var timer=null;"
-"        if(v.requestVideoFrameCallback){"
-"          var last=0,minGap=1000/fps;"
-"          (function loop(now){"
-"            if(stopped)return;"
-"            if(!last||now-last>=minGap-2){last=now||0;draw();}"
-"            try{v.requestVideoFrameCallback(loop);}catch(e){stopped=true;}"
-"          })(0);"
-"          post({ev:'cam-scale-mode',mode:'frame-callback',fps:fps});"
-"        }else{"
-"          timer=setInterval(draw,Math.max(33,Math.round(1000/fps)));"
-"          post({ev:'cam-scale-mode',mode:'timer',fps:fps});"
-"        }"
-"        var out,nt;"
-"        try{out=cv.captureStream(fps);nt=out.getVideoTracks()[0];}catch(e){}"
-"        if(!nt){clearInterval(timer);"
-"          post({ev:'cam-scale-error',why:'captureStream gave no track'});"
-"          resolve(st);return;}"
-"        var oStop=nt.stop.bind(nt);"
-"        nt.stop=function(){stopped=true;if(timer)clearInterval(timer);"
-"          try{vt.stop();}catch(e){}"
-"          try{v.pause();v.srcObject=null;}catch(e){}"
-"          try{v.remove();}catch(e){}"
-"          oStop();};"
-"        var ms=new MediaStream();"
-"        ms.addTrack(nt);"
-"        st.getAudioTracks().forEach(function(a){ms.addTrack(a);});"
-"        ms.__bbScale={v:v,cv:cv,src:vt,timer:timer};"
-"        post({ev:'cam-scaled',from:{w:s.width||0,h:s.height||0},"
-"              to:{w:cv.width,h:cv.height},fps:fps});"
-"        resolve(ms);"
-"      }"
-"      v.addEventListener('loadedmetadata',go);"
-"      v.addEventListener('playing',go);"
-"      setTimeout(go,400);"        /* never leave the page waiting */
-"    });"
-"  }catch(e){post({ev:'cam-scale-error',why:String((e&&e.message)||e)});"
-"    return Promise.resolve(st);}"
-"}"
 "function countKinds(c){"
 "  if(!origEnum)return Promise.resolve(null);"
 "  return origEnum().then(function(l){"
@@ -499,23 +501,47 @@ static const char *SHIM_JS =
 "  return n==='NotReadableError'||n==='AbortError'||n==='OverconstrainedError'||"
 "         n==='TimeoutError'||n==='NotFoundError'||n==='TypeError'||!n;"
 "}"
+"function fixMic(st,c){"
+"  if(!C.micMatch||!wants(c,'audio'))return Promise.resolve(st);"
+"  var asked=c.audio&&typeof c.audio==='object'&&c.audio.deviceId;"
+"  var at=st.getAudioTracks()[0];"
+"  if(asked||!at)return Promise.resolve(st);"
+"  return pinDevice().then(function(){"
+"    var have='';try{have=at.getSettings().deviceId;}catch(e){}"
+"    if(!pinnedA||have===pinnedA)return st;"
+"    return origGUM({audio:{deviceId:{exact:pinnedA}}}).then(function(s2){"
+"      var nt=s2.getAudioTracks()[0];"
+"      if(!nt)return st;"
+"      st.removeTrack(at);try{at.stop();}catch(e){}"
+"      st.addTrack(nt);"
+"      post({ev:'mic-swapped',from:at.label,to:nt.label});"
+"      return st;"
+"    },function(e){post({ev:'mic-swap-failed',name:e&&e.name});return st;});"
+"  });"
+"}"
 "md.getUserMedia=function(c){"
 "  var t0=now();"
 "  post({ev:'gum-call',frame:location.href.slice(0,80),constraints:safe(c)});"
 "  var hit=serve(c);"
-"  if(hit){post({ev:'gum-cache-hit'});return scaleStream(hit,c);}"
+"  if(hit){"
+"    var ht=hit.getVideoTracks()[0];"
+"    post({ev:'gum-cache-hit',track:ht?ht.id:null,"
+"          same:!!(ht&&cachedV&&ht===cachedV)});"
+"    return Promise.resolve(hit);}"
 "  return pinDevice().then(function(){"
 "    var start=C.relax?1:0,levels=[],l;"
 "    for(l=start;l<=3&&levels.length<=C.retries;l++)levels.push(l);"
 "    if(!levels.length)levels=[start];"
 "    var i=0,audioDropped=false;"
 "    function attempt(){"
-"      var cc=withoutMic(withForce(withPin(relax(c,levels[i]))));"
+"      var cc=looseFps(withoutMic(withPin(relax(c,levels[i]))));"
 "      post({ev:'gum-try',level:levels[i],constraints:safe(cc)});"
 "      return origGUM(cc).then(function(st){"
 "        post({ev:'gum-ok',ms:Math.round(now()-t0),level:levels[i]});"
-"        st.getTracks().forEach(dumpTrack);"
-"        return scaleStream(keep(st),c);"
+"        return fixMic(st,c).then(function(st){"
+"          st.getTracks().forEach(dumpTrack);"
+"          return keep(st);"
+"        });"
 "      }).catch(function(err){"
 "        post({ev:'gum-error',name:err&&err.name,message:err&&err.message,"
 "              constraint:err&&err.constraint,level:levels[i],ms:Math.round(now()-t0)});"
@@ -556,25 +582,16 @@ static const char *SHIM_JS =
 "    return l;});};"
 "window.__bbWarm=function(){"
 "  return md.getUserMedia({video:true}).then(function(s){"
-"    s.getTracks().forEach(function(t){t.stop();});"   /* stops the clone only */
+"    s.getTracks().forEach(function(t){t.stop();});"   /* drops our share only */
 "    post({ev:'warm-ok'});return true;"
 "  }).catch(function(e){post({ev:'warm-error',name:e&&e.name,message:e&&e.message});return false;});"
 "};"
 "window.__bbRelease=function(){"
+"  shareRefs=0;"
+"  if(realStop)try{realStop();}catch(e){}"
 "  [cachedV,cachedA].forEach(function(t){if(t)try{t.stop();}catch(e){}});"
 "  cachedV=cachedA=null;post({ev:'released'});return true;"
 "};"
-/*
- * Holding the capture open is the whole point of sharing, but holding it
- * after the page has stopped every clone leaves the camera light on with
- * nothing watching. So the hold expires once no handed-out track is live.
- */
-"if(C.cache&&C.holdMs>0)setInterval(function(){"
-"  if(!cachedV&&!cachedA)return;"
-"  if(anyLive()){lastServe=now();return;}"
-"  if(now()-lastServe<C.holdMs)return;"
-"  window.__bbRelease();post({ev:'cam-hold-expired'});"
-"},1000);"
 /*
  * WebKitGTK's WebRTC is GStreamer-based and its offers differ from the
  * ones a site tested against Chrome. Two of those differences stop a
@@ -605,33 +622,84 @@ static const char *SHIM_JS =
 "  if(changed)post({ev:'sdp-ssrc-added'});"
 "  return parts.join('');"
 "}"
+/*
+ * What was actually negotiated, from the SDP itself: per media section
+ * its direction, any bandwidth ceiling the far end asked for, and the
+ * codecs in the order they were offered or accepted. When a stream is
+ * sent and the far end shows nothing, this says whether the two sides
+ * even agreed on a codec, and whether a limit was requested that we are
+ * ignoring.
+ */
+"function sdpSummary(sdp){"
+"  if(!sdp)return null;"
+"  var out=[],cur=null;"
+"  sdp.split(/\\r?\\n/).forEach(function(l){"
+"    var m=/^m=(\\w+)\\s+\\d+\\s+\\S+\\s+(.*)$/.exec(l);"
+"    if(m){cur={kind:m[1],pts:m[2].split(/\\s+/),dir:'',bw:'',names:{}};out.push(cur);return;}"
+"    if(!cur)return;"
+"    if(/^a=(sendrecv|sendonly|recvonly|inactive)/.test(l))cur.dir=l.slice(2);"
+"    else if(/^b=/.test(l))cur.bw=l.slice(2);"
+"    var r=/^a=rtpmap:(\\d+)\\s+([^/]+)/.exec(l);"
+"    if(r)cur.names[r[1]]=r[2];"
+"  });"
+"  return out.map(function(s){"
+"    return {kind:s.kind,dir:s.dir,bw:s.bw,"
+"            codecs:s.pts.map(function(p){return p+' '+(s.names[p]||'?');})};"
+"  });"
+"}"
+"function firstVideo(sdp){"
+"  var s=sdpSummary(sdp)||[],i,j;"
+"  for(i=0;i<s.length;i++){if(s[i].kind!=='video')continue;"
+"    for(j=0;j<s[i].codecs.length;j++){"
+"      var n=s[i].codecs[j].split(' ')[1]||'';"
+"      if(!/^(rtx|red|ulpfec|flexfec-03|\\?)$/i.test(n))return n.toUpperCase();}}"
+"  return null;"
+"}"
+"function postSdp(which,sdp){"
+"  try{var sum=sdpSummary(sdp);if(sum)post({ev:'sdp',which:which,m:sum});}catch(e){}"
+"}"
 "function codecPrefs(pc){"
 "  if(!C.codecs||!C.codecs.length)return;"
 "  try{"
 "    var caps=window.RTCRtpSender&&RTCRtpSender.getCapabilities?"
 "             RTCRtpSender.getCapabilities('video'):null;"
 "    if(!caps||!caps.codecs)return;"
-"    var want=C.codecs,groups=[],rest=[],i,j;"
-"    for(i=0;i<want.length;i++)groups.push([]);"
+"    var want=C.codecs.map(function(w){return w.toLowerCase().replace(/^video\\//,'');});"
+"    var front=[],rest=[];"
 "    caps.codecs.forEach(function(c){"
-"      var m=(c.mimeType||'').toLowerCase(),hit=-1;"
-"      for(j=0;j<want.length;j++){"
-"        var w=want[j].toLowerCase();"
-"        if(m===w||m==='video/'+w)hit=j;"
-"      }"
-"      if(hit>=0)groups[hit].push(c);else rest.push(c);"
-"    });"
-"    var flat=[];"
-"    groups.forEach(function(g){g.forEach(function(c){flat.push(c);});});"
-"    rest.forEach(function(c){flat.push(c);});"
-"    if(!flat.length)return;"
+"      var m=(c.mimeType||'').toLowerCase().replace(/^video\\//,'');"
+"      (want.indexOf(m)>=0?front:rest).push(c);});"
+"    front.sort(function(a,b){"
+"      return want.indexOf(a.mimeType.toLowerCase().replace(/^video\\//,''))-"
+"             want.indexOf(b.mimeType.toLowerCase().replace(/^video\\//,''));});"
+"    var flat=front.concat(rest);"
+"    if(!front.length)return;"
 "    pc.getTransceivers().forEach(function(t){"
-"      if(t.setCodecPreferences&&t.sender&&t.sender.track&&"
-"         t.sender.track.kind==='video')"
+"      if(t.setCodecPreferences&&t.sender&&t.sender.track&&t.sender.track.kind==='video')"
 "        try{t.setCodecPreferences(flat);}catch(e){}"
 "    });"
-"    post({ev:'codec-pref',order:flat.slice(0,4).map(function(c){return c.mimeType;})});"
 "  }catch(e){}"
+"}"
+"function sdpPreferCodecs(sdp,want){"
+"  if(!sdp||!want||!want.length)return sdp;"
+"  var parts=sdp.split(/(?=\\r?\\nm=)/),changed=false,order=null;"
+"  for(var i=0;i<parts.length;i++){"
+"    var sec=parts[i],m=/(^|\\n)(m=video [^\\r\\n]*? )([0-9 ]+)(\\r?\\n|$)/.exec(sec);"
+"    if(!m||/a=(recvonly|inactive)/.test(sec))continue;"
+"    var pts=m[3].trim().split(/\\s+/),names={},re=/a=rtpmap:(\\d+) ([^\\/\\r\\n]+)/g,r;"
+"    while((r=re.exec(sec)))names[r[1]]=r[2].toLowerCase();"
+"    var front=[];"
+"    want.forEach(function(w){w=w.toLowerCase().replace(/^video\\//,'');"
+"      pts.forEach(function(pt){if(names[pt]===w&&front.indexOf(pt)<0)front.push(pt);});});"
+"    if(!front.length)continue;"
+"    var rest=pts.filter(function(pt){return front.indexOf(pt)<0;});"
+"    var np=front.concat(rest).join(' ');"
+"    if(np===pts.join(' '))continue;"
+"    parts[i]=sec.replace(m[0],m[1]+m[2]+np+m[4]);"
+"    changed=true;order=front.map(function(pt){return pt+' '+names[pt];});"
+"  }"
+"  if(changed)post({ev:'codec-pref',order:order});"
+"  return parts.join('');"
 "}"
 /*
  * Where does a publish actually stop? The offer rewriting only helps if an
@@ -699,13 +767,115 @@ static const char *SHIM_JS =
 "if(C.rtcTrace){(function(){"
 "  var O=window.RTCPeerConnection;"
 "  if(!O){post({ev:'rtc-missing'});return;}"
+"  var pcs=[];"
+/*
+ * Whether anything is actually going out. A connected ICE pair proves a
+ * path exists, not that the encoder ever produced a frame - and those two
+ * failures look identical from the outside: the other end shows a
+ * spinner. framesEncoded stays 0 when the camera track delivers nothing,
+ * bytesSent grows when it does.
+ */
+"  var vlast=new WeakMap(),vids=[];"
+"  setInterval(function(){"
+"    var l=document.querySelectorAll('video');"
+"    for(var i=0;i<l.length;i++){var v=l[i];"
+"      if(!v.srcObject)continue;"
+"      if(vids.indexOf(v)<0)vids.push(v);"
+"      var q=null;try{q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;}catch(e){}"
+"      var r=v.getBoundingClientRect(),st=getComputedStyle(v),vt=[];"
+"      try{vt=v.srcObject.getVideoTracks();}catch(e){}"
+"      var o={ev:'video-state',v:vids.indexOf(v),id:v.id||v.className||'',"
+"        ready:v.readyState,paused:v.paused,w:v.videoWidth,h:v.videoHeight,"
+"        ct:Math.round(v.currentTime||0),frames:q?q.totalVideoFrames:-1,"
+"        dropped:q?q.droppedVideoFrames:-1,"
+"        box:Math.round(r.width)+'x'+Math.round(r.height),"
+"        shown:st.display!=='none'&&st.visibility!=='hidden'&&+st.opacity>0,"
+"        track:vt.length?(vt[0].id.slice(0,8)+' '+vt[0].readyState+(vt[0].muted?'/muted':'')):'none'};"
+"      var k=JSON.stringify(o);"
+"      if(vlast.get(v)===k)continue;"
+"      vlast.set(v,k);post(o);"
+"    }"
+"  },3000);"
+"  try{var SD=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'srcObject');"
+"    if(SD&&SD.set)Object.defineProperty(HTMLMediaElement.prototype,'srcObject',{configurable:true,"
+"      get:SD.get,set:function(v){"
+"        var vt=[];try{vt=v&&v.getVideoTracks?v.getVideoTracks():[];}catch(e){}"
+"        if(this.tagName==='VIDEO')post({ev:'video-attach',id:this.id||this.className||'',"
+"          track:vt.length?vt[0].id.slice(0,8):(v?'no-video':'null')});"
+"        return SD.set.call(this,v);}});}catch(e){}"
+"  try{var HP=HTMLMediaElement.prototype,oPlay=HP.play;"
+"    HP.play=function(){var v=this,p=oPlay.apply(v,arguments);"
+"      if(p&&p.catch)p.catch(function(e){"
+"        post({ev:'play-rejected',name:e&&e.name,message:String((e&&e.message)||e),"
+"              srcObject:!!v.srcObject,muted:v.muted});});"
+"      return p;};}catch(e){}"
+"  var last={};"
+"  setInterval(function(){"
+"    pcs.forEach(function(pc,i){"
+"      if(!pc.getStats||pc.signalingState==='closed')return;"
+"      pc.getStats().then(function(r){"
+"        if(!r||!r.forEach)return;"
+"        var o={ev:'rtc-stats',pc:i},any=false,codecs={};"
+/* The codec stats have to be collected first: an outbound-rtp only
+ * carries a codecId pointing at one of them. What is actually being
+ * encoded is the whole question when the far end shows nothing. */
+"        r.forEach(function(s){"
+"          if(s.type==='codec')codecs[s.id]={mime:s.mimeType,pt:s.payloadType};"
+"        });"
+"        r.forEach(function(s){"
+"          var k=s.kind||s.mediaType||'?';"
+"          if(s.type==='outbound-rtp'){any=true;"
+"            var c=codecs[s.codecId]||{};"
+"            o['out-'+k]={ssrc:s.ssrc||0,bytes:s.bytesSent||0,enc:s.framesEncoded||0,"
+"                         sent:s.framesSent||0,pkts:s.packetsSent||0,"
+"                         w:s.frameWidth||0,h:s.frameHeight||0,"
+"                         codec:c.mime||null,pt:c.pt,"
+"                         pli:s.pliCount||0,nack:s.nackCount||0,fir:s.firCount||0,"
+"                         keys:s.keyFramesEncoded||0,"
+"                         limited:s.qualityLimitationReason||null,"
+"                         target:s.targetBitrate||0};}"
+"          else if(s.type==='inbound-rtp'){any=true;"
+"            o['in-'+k]={ssrc:s.ssrc||0,bytes:s.bytesReceived||0,dec:s.framesDecoded||0,"
+"                        keys:s.keyFramesDecoded||0,w:s.frameWidth||0,h:s.frameHeight||0,"
+"                        pkts:s.packetsReceived||0,lost:s.packetsLost||0,"
+"                        disc:s.packetsDiscarded||0,"
+"                        pli:s.pliCount||0,fir:s.firCount||0,nack:s.nackCount||0};}"
+/* The far end's own receiver report, sent back over RTCP. Its presence
+ * proves our packets are arriving there; lost and rtt say in what state. */
+"          else if(s.type==='remote-inbound-rtp'){any=true;"
+"            o['far-'+k]={lost:s.packetsLost,frac:s.fractionLost,"
+"                         jitter:s.jitter,rtt:s.roundTripTime};}"
+"          else if(s.type==='candidate-pair'&&(s.nominated||s.state==='succeeded')){"
+"            o.pair={state:s.state,sent:s.bytesSent||0,recv:s.bytesReceived||0};}"
+"        });"
+"        try{pc.getSenders().forEach(function(sn){"
+"          if(!sn.track)return;any=true;"
+"          var g={};try{g=sn.track.getSettings?sn.track.getSettings():{};}catch(e){}"
+"          o['track-'+sn.track.kind]={state:sn.track.readyState,muted:!!sn.track.muted,"
+"                                     w:g.width||0,h:g.height||0};"
+"        });}catch(e){}"
+"        try{pc.getReceivers().forEach(function(rv){"
+"          if(!rv.track)return;any=true;"
+"          o['rtrack-'+rv.track.kind]={id:rv.track.id.slice(0,8),state:rv.track.readyState,muted:!!rv.track.muted};"
+"        });}catch(e){}"
+"        if(!any)return;"
+"        var key=JSON.stringify(o);"
+"        if(key===last[i])return;"          /* nothing moved, do not repeat */
+"        last[i]=key;post(o);"
+"      }).catch(function(e){"
+"        if(!pc.__bbStatsErr){pc.__bbStatsErr=1;"
+"          post({ev:'rtc-stats-error',pc:i,message:String((e&&e.message)||e)});}"
+"      });"
+"    });"
+"  },3000);"
 "  function W(){"
 "    var pc=new O(arguments[0],arguments[1]);"
-"    post({ev:'rtc-new'});"
+"    pcs.push(pc);var id=pcs.length-1;"
+"    post({ev:'rtc-new',pc:id});"
 "    ['icegatheringstatechange','iceconnectionstatechange',"
 "     'connectionstatechange','signalingstatechange'].forEach(function(e){"
 "      try{pc.addEventListener(e,function(){"
-"        post({ev:'rtc-state',on:e,ice:pc.iceConnectionState,"
+"        post({ev:'rtc-state',pc:id,on:e,ice:pc.iceConnectionState,"
 "              conn:pc.connectionState,sig:pc.signalingState});});}catch(x){}"
 "    });"
 "    return pc;"
@@ -715,17 +885,60 @@ static const char *SHIM_JS =
 "  window.RTCPeerConnection=W;"
 "  if(window.webkitRTCPeerConnection)window.webkitRTCPeerConnection=W;"
 "  ['addTrack','addTransceiver','addStream','setRemoteDescription',"
-"   'createOffer','createAnswer','setLocalDescription'].forEach(function(m){"
+"   'createOffer','createAnswer','setLocalDescription','addIceCandidate',"
+"   'setConfiguration','getStats','close'].forEach(function(m){"
 "    var f=O.prototype[m];"
 "    if(!f)return;"
 "    O.prototype[m]=function(){"
 "      var a0=arguments[0];"
 "      var d=(m==='setRemoteDescription'&&a0&&a0.type)?a0.type:"
 "            (a0&&a0.kind)?a0.kind:undefined;"
-"      post({ev:'rtc-call',fn:m,arg:d});"
-"      return f.apply(this,arguments);"
+"      if(m!=='getStats')post({ev:'rtc-call',fn:m,arg:d});"
+"      var r;"
+"      try{r=f.apply(this,arguments);}"
+"      catch(e){post({ev:'rtc-error',fn:m,when:'threw',"
+"                     name:e&&e.name,message:String((e&&e.message)||e)});throw e;}"
+/* A handler here does not take the rejection away from the page: it
+ * still gets the promise it was given, with its own handlers. */
+"      if(r&&r.then)r.then(undefined,function(e){"
+"        post({ev:'rtc-error',fn:m,when:'rejected',"
+"              name:e&&e.name,message:String((e&&e.message)||e)});});"
+"      return r;"
 "    };"
 "  });"
+/*
+ * Where a publisher sets its bitrate. WebKit requires
+ * RTCRtpSendParameters.codecs and Firefox does not, so a library on its
+ * Firefox path throws here - after the offer is made and before the
+ * local description is set, which looks like the site simply giving up.
+ * Traced whether or not --rtc-params-fix is repairing it.
+ */
+"  var SND=window.RTCRtpSender;"
+"  if(SND&&SND.prototype&&SND.prototype.setParameters){"
+"    var oSP2=SND.prototype.setParameters;"
+"    SND.prototype.setParameters=function(p){"
+"      post({ev:'rtc-call',fn:'setParameters',"
+"            arg:(p&&p.encodings&&p.encodings.length)?('encodings:'+p.encodings.length):undefined,"
+"            keys:p?Object.keys(p):[]});"
+"      var r;"
+"      try{r=oSP2.apply(this,arguments);}"
+"      catch(e){post({ev:'rtc-error',fn:'setParameters',when:'threw',"
+"                     name:e&&e.name,message:String((e&&e.message)||e)});throw e;}"
+"      if(r&&r.then)r.then(undefined,function(e){"
+"        post({ev:'rtc-error',fn:'setParameters',when:'rejected',"
+"              name:e&&e.name,message:String((e&&e.message)||e)});});"
+"      return r;"
+"    };"
+"  }"
+/* And what the page itself fails on, which is otherwise invisible. */
+"  try{"
+"    window.addEventListener('error',function(e){"
+"      post({ev:'page-error',message:String((e&&e.message)||e),"
+"            src:((e&&e.filename)||'').slice(-60),line:(e&&e.lineno)||0});});"
+"    window.addEventListener('unhandledrejection',function(e){"
+"      var r=e&&e.reason;"
+"      post({ev:'page-reject',name:r&&r.name,message:String((r&&r.message)||r)});});"
+"  }catch(e){}"
 /*
  * A publisher library decides up front whether it supports this browser,
  * from the user agent and a handful of API checks. When it decides not to,
@@ -763,17 +976,151 @@ static const char *SHIM_JS =
 "  };"
 "  post({ev:'params-fix-on'});"
 "})();}"
-"if(C.ssrcFix||(C.codecs&&C.codecs.length)){(function(){"
+"if(C.ssrcFix||C.rtcTrace||(C.codecs&&C.codecs.length)){(function(){"
 "  var P=window.RTCPeerConnection;"
 "  if(!P){post({ev:'rtc-missing'});return;}"
 "  var cname=rtcCname();"
 "  var oCO=P.prototype.createOffer,oCA=P.prototype.createAnswer,"
 "      oSLD=P.prototype.setLocalDescription;"
 "  function patch(d){"
-"    if(!C.ssrcFix||!d||!d.sdp)return d;"
-"    var s=sdpAddSsrc(d.sdp,cname);"
+"    if(!d||!d.sdp)return d;"
+"    var s=d.sdp;"
+"    if(C.codecs&&C.codecs.length)s=sdpPreferCodecs(s,C.codecs);"
+"    if(C.ssrcFix)s=sdpAddSsrc(s,cname);"
 "    return s===d.sdp?d:{type:d.type,sdp:s};"
 "  }"
+"  function fakesIn(sdp,map){"
+"    var want=[],vals={},k;"
+"    for(k in map)vals[map[k]]=1;"
+"    (sdp||'').split(/(?=\\r?\\nm=)/).forEach(function(sec){"
+"      var m=new RegExp('a=ssrc:(\\\\d+) cname:'+cname).exec(sec),"
+"          mid=/a=mid:(\\S+)/.exec(sec),kd=/m=(audio|video)/.exec(sec);"
+"      if(m&&kd&&!map[m[1]]&&!vals[m[1]])"
+"        want.push({fake:m[1],mid:mid?mid[1]:null,kind:kd[1]});"
+"    });"
+"    return want;"
+"  }"
+"  function hookLD(pc){"
+"    if(pc.__bbLD)return;pc.__bbLD=true;"
+"    ['localDescription','currentLocalDescription','pendingLocalDescription'].forEach(function(n){"
+"      var d=Object.getOwnPropertyDescriptor(P.prototype,n);"
+"      if(!d||!d.get)return;"
+"      try{Object.defineProperty(pc,n,{configurable:true,get:function(){"
+"        var v=d.get.call(pc);if(!v||!v.sdp)return v;"
+"        var x=v.sdp,k,map=pc.__bbMap||{};"
+"        for(k in map)x=x.split('a=ssrc:'+k+' ').join('a=ssrc:'+map[k]+' ');"
+"        return x===v.sdp?v:new RTCSessionDescription({type:v.type,sdp:x});"
+"      }});}catch(e){}"
+"    });"
+"  }"
+"  var SS={map:{},pending:{},info:{}};"
+"  function ssrcRe(f){return new RegExp('(^|[^0-9])'+f+'(?![0-9])','g');}"
+"  function realSsrc(pc){"
+"    var map=pc.__bbMap||(pc.__bbMap={});"
+"    var want=fakesIn(pc.localDescription&&pc.localDescription.sdp,map);"
+"    hookLD(pc);"
+"    if(!want.length)return;"
+"    want.forEach(function(w){SS.pending[w.fake]=1;});"
+"    var t0=Date.now();"
+"    function look(){"
+"      var trs=[];try{trs=pc.getTransceivers();}catch(e){}"
+"      Promise.all(want.map(function(w){"
+"        if(map[w.fake])return null;"
+"        var tr=trs.filter(function(t){return w.mid!==null&&t.mid===w.mid;})[0];"
+"        var q;try{q=(tr&&tr.sender&&tr.sender.getStats)?tr.sender.getStats():pc.getStats();}"
+"        catch(e){q=pc.getStats();}"
+"        return Promise.resolve(q).then(function(r){"
+"          var hit=null,cid=null,cod={};"
+"          r.forEach(function(st){if(st.type==='codec')cod[st.id]=st;});"
+"          r.forEach(function(st){"
+"            if(st.type!=='outbound-rtp'||!st.ssrc||hit)return;"
+"            if(st.mid&&w.mid&&st.mid!==w.mid)return;"
+"            var sk=st.kind||st.mediaType;"
+"            if(sk&&sk!==w.kind)return;"
+"            hit=st.ssrc;cid=st.codecId;"
+"          });"
+"          if(hit){var cc=cod[cid]||{};"
+"            SS.info[String(hit)]={pt:cc.payloadType,mime:cc.mimeType||null};}"
+"          if(hit){map[w.fake]=String(hit);SS.map[w.fake]=String(hit);delete SS.pending[w.fake];"
+"            post({ev:'ssrc-real',kind:w.kind,mid:w.mid,fake:+w.fake,real:+hit,ms:Date.now()-t0});}"
+"        },function(){});"
+"      })).then(function(){"
+"        var left=want.filter(function(w){return !map[w.fake];});"
+"        if(!left.length)return;"
+"        if(Date.now()-t0<15000){setTimeout(look,150);return;}"
+"        left.forEach(function(w){delete SS.pending[w.fake];"
+"          post({ev:'ssrc-real-missing',kind:w.kind,mid:w.mid,fake:+w.fake});});"
+"      });"
+"    }"
+"    look();"
+"  }"
+"  function ssrcRewrite(d){"
+"    if(typeof d!=='string')return {d:d,n:0};"
+"    var n=0,f;"
+"    for(f in SS.map){var re=ssrcRe(f);"
+"      if(re.test(d)){n++;d=d.replace(ssrcRe(f),'$1'+SS.map[f]);}}"
+"    return {d:d,n:n};"
+"  }"
+"  function ptFix(d){"
+"    if(typeof d!=='string')return {d:d,n:0};"
+"    var i=d.indexOf('['),j=d.indexOf('{'),k=i<0?j:(j<0?i:Math.min(i,j));"
+"    if(k<0)return {d:d,n:0};"
+"    var body;try{body=JSON.parse(d.slice(k));}catch(e){return {d:d,n:0};}"
+"    var n=0;"
+"    (function walk(o,depth){"
+"      if(!o||typeof o!=='object'||depth>12)return;"
+"      if(Array.isArray(o.codecs)&&Array.isArray(o.encodings)){"
+"        var info=null;"
+"        o.encodings.forEach(function(e){if(e&&SS.info[String(e.ssrc)])info=SS.info[String(e.ssrc)];});"
+"        var media=o.codecs.filter(function(c){"
+"          return c&&c.mimeType&&!/\\/(rtx|red|ulpfec|flexfec)/i.test(c.mimeType);});"
+"        var c=media[0];"
+"        if(info&&c&&info.pt!=null){"
+"          if(info.mime&&c.mimeType.toLowerCase()!==info.mime.toLowerCase())"
+"            post({ev:'codec-mismatch',sending:info.mime,agreed:c.mimeType});"
+"          else if(c.payloadType!==info.pt){"
+"            var old=c.payloadType;c.payloadType=info.pt;"
+"            o.codecs.forEach(function(x){"
+"              if(x&&x.parameters&&x.parameters.apt===old)x.parameters.apt=info.pt;});"
+"            n++;post({ev:'pt-fixed',mime:c.mimeType,from:old,to:info.pt});"
+"          }"
+"        }"
+"      }"
+"      for(var key in o)if(Object.prototype.hasOwnProperty.call(o,key))walk(o[key],depth+1);"
+"    })(body,0);"
+"    return n?{d:d.slice(0,k)+JSON.stringify(body),n:n}:{d:d,n:0};"
+"  }"
+"  function ssrcPending(d){"
+"    if(typeof d!=='string')return false;"
+"    for(var f in SS.pending)if(ssrcRe(f).test(d))return true;"
+"    return false;"
+"  }"
+"  if(C.ssrcFix&&window.WebSocket){(function(){"
+"    var WS=window.WebSocket.prototype,oSend=WS.send;"
+"    function flush(ws,t0,timedOut){"
+"      var q=ws.__bbQ||[],n=0;ws.__bbQ=null;"
+"      q.forEach(function(d){var r=ssrcRewrite(d);n+=r.n;r=ptFix(r.d);try{oSend.call(ws,r.d);}catch(e){}});"
+"      post({ev:'ssrc-ws',held:q.length,rewritten:n,ms:Date.now()-t0,timeout:!!timedOut});"
+"    }"
+"    WS.send=function(d){"
+"      var ws=this;"
+"      if(ws.__bbQ){ws.__bbQ.push(d);return;}"
+"      if(ssrcPending(d)){"
+"        ws.__bbQ=[d];var t0=Date.now();"
+"        (function wait(){"
+"          if(!ws.__bbQ)return;"
+"          var still=ws.__bbQ.some(ssrcPending);"
+"          if(!still)flush(ws,t0,false);"
+"          else if(Date.now()-t0>8000)flush(ws,t0,true);"
+"          else setTimeout(wait,100);"
+"        })();"
+"        return;"
+"      }"
+"      var r=ssrcRewrite(d);"
+"      if(r.n){post({ev:'ssrc-ws',held:0,rewritten:r.n,ms:0,timeout:false});r=ptFix(r.d);}"
+"      return oSend.call(ws,r.d);"
+"    };"
+"  })();}"
 "  P.prototype.createOffer=function(){"
 "    var pc=this,a=arguments;"
 "    codecPrefs(pc);"
@@ -793,15 +1140,61 @@ static const char *SHIM_JS =
 "  P.prototype.setLocalDescription=function(d){"
 "    var pc=this;"
 "    return Promise.resolve(oSLD.call(pc,patch(d))).then(function(r){"
+"      var sdp=(pc.localDescription&&pc.localDescription.sdp)||'';"
 "      if(C.ssrcFix)try{"
-"        var sdp=(pc.localDescription&&pc.localDescription.sdp)||'';"
 "        var n=(sdp.match(/a=ssrc:\\d+ cname:/g)||[]).length;"
 "        post({ev:'sdp-ssrc-verify',cnameLines:n,kept:n>0});"
 "      }catch(e){}"
+"      postSdp('local-'+((pc.localDescription&&pc.localDescription.type)||'?'),sdp);"
+"      if(C.ssrcFix)try{realSsrc(pc);}catch(e){}"
+"      return r;"
+"    });"
+"  };"
+"  var oSRD=P.prototype.setRemoteDescription;"
+"  P.prototype.setRemoteDescription=function(d){"
+"    var pc=this;"
+"    return Promise.resolve(oSRD.apply(pc,arguments)).then(function(r){"
+"      postSdp('remote-'+((d&&d.type)||'?'),(d&&d.sdp)||"
+"              ((pc.remoteDescription&&pc.remoteDescription.sdp)||''));"
+"      try{if(d&&d.type==='answer'){"
+"        var mine=firstVideo(pc.localDescription&&pc.localDescription.sdp),"
+"            theirs=firstVideo(d.sdp);"
+"        if(mine&&theirs&&mine!==theirs)"
+"          post({ev:'codec-mismatch',sending:mine,agreed:theirs});"
+"      }}catch(e){}"
 "      return r;"
 "    });"
 "  };"
 "  post({ev:'rtc-wrapped',ssrcFix:!!C.ssrcFix,codecs:C.codecs||[]});"
+"})();}"
+"if(C.silentSplit){(function(){"
+"  var D=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'srcObject');"
+"  if(!D||!D.set||!D.get||!window.MediaStream)return;"
+"  Object.defineProperty(HTMLMediaElement.prototype,'srcObject',{configurable:true,"
+"    get:function(){return this.__bbSplit?this.__bbOrig:D.get.call(this);},"
+"    set:function(v){this.__bbSplit=false;this.__bbOrig=v;this.__bbAt=Date.now();"
+"      return D.set.call(this,v);}});"
+"  function rejoin(el,why){"
+"    if(!el.__bbSplit)return;"
+"    el.__bbSplit=false;D.set.call(el,el.__bbOrig);"
+"    try{el.play().catch(function(){});}catch(e){}"
+"    post({ev:'video-audio-rejoin',id:el.id||'',why:why});"
+"  }"
+"  setInterval(function(){"
+"    var l=document.querySelectorAll('video');"
+"    for(var i=0;i<l.length;i++){var el=l[i],st=el.__bbOrig;"
+"      if(el.__bbSplit||!st||!st.getAudioTracks||el.readyState>0)continue;"
+"      if(Date.now()-(el.__bbAt||0)<2500)continue;"
+"      var vt=st.getVideoTracks(),at=st.getAudioTracks();"
+"      if(!vt.length||!at.length||vt[0].muted||vt[0].readyState!=='live')continue;"
+"      if(!at.every(function(t){return t.muted;}))continue;"
+"      el.__bbSplit=true;"
+"      D.set.call(el,new MediaStream(vt));"
+"      try{el.play().catch(function(){});}catch(e){}"
+"      post({ev:'video-audio-split',id:el.id||'',audio:at.length});"
+"      at.forEach(function(t){t.addEventListener('unmute',function(){rejoin(el,'audio-unmuted');},{once:true});});"
+"    }"
+"  },1000);"
 "})();}"
 "window.__bbHeld=function(){"
 "  return !!(cachedV&&cachedV.readyState==='live')||!!(cachedA&&cachedA.readyState==='live');"
@@ -1048,7 +1441,8 @@ dump_gstreamer_env (void)
     dump_env ("GST_DEBUG");
     dump_env ("GST_DEBUG_FILE");
     dump_env ("WEBKIT_DEBUG");
-    dump_env ("WEBKIT_GST_ENABLE_HW_DECODERS");
+    dump_env ("GST_PLUGIN_FEATURE_RANK");
+    dump_env ("WEBKIT_GST_DISABLE_WEBRTC_NETWORK_SANDBOX");
     dump_env ("WEBKIT_DISABLE_DMABUF_RENDERER");
     dump_env ("WEBKIT_DISABLE_COMPOSITING_MODE");
 
@@ -1121,6 +1515,8 @@ capture_prewarm (gpointer u)
         gst_object_unref (mon);
         return G_SOURCE_REMOVE;
     }
+    if (!device_monitor_wait_started (mon, 5000))
+        mlog ("prewarm: device providers did not finish starting in 5 s, list may be short");
 
     GList *devs = gst_device_monitor_get_devices (mon);
     int n = 0;
@@ -1359,6 +1755,24 @@ on_web_process_terminated (WebKitWebView *view,
 
 /* ------------------------------------------------- script message routing */
 
+/* "sending":"H264" -> a new "H264" (short codec names, no escapes) */
+static char *
+json_str (const char *json, const char *key)
+{
+    char       *needle = g_strdup_printf ("\"%s\":\"", key);
+    const char *p      = json ? strstr (json, needle) : NULL;
+    char       *v      = NULL;
+
+    if (p) {
+        p += strlen (needle);
+        const char *e = strchr (p, '"');
+        if (e && e - p < 64)
+            v = g_strndup (p, e - p);
+    }
+    g_free (needle);
+    return v;
+}
+
 static gboolean
 ev_is (const char *json, const char *ev)
 {
@@ -1389,14 +1803,23 @@ on_script_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
         ev_is (s, "gum-ok")     || ev_is (s, "gum-error") ||
         ev_is (s, "gum-cache-hit") || ev_is (s, "gum-drop-audio") ||
         ev_is (s, "sdp-ssrc-added") || ev_is (s, "codec-pref") ||
+        ev_is (s, "codec-mismatch") || ev_is (s, "ssrc-real") ||
+        ev_is (s, "ssrc-real-missing") || ev_is (s, "ssrc-ws") ||
+        ev_is (s, "rtc-stats-error") || ev_is (s, "video-state") ||
+        ev_is (s, "play-rejected") || ev_is (s, "pt-fixed") ||
+        ev_is (s, "mic-pin") || ev_is (s, "cam-pin") ||
+        ev_is (s, "video-attach") || ev_is (s, "mic-swapped") ||
+        ev_is (s, "mic-swap-failed") || ev_is (s, "video-audio-split") ||
+        ev_is (s, "video-audio-rejoin") || ev_is (s, "gum-fps-loosened") ||
         ev_is (s, "rtc-wrapped")   || ev_is (s, "rtc-missing") ||
         ev_is (s, "rtc-new")       || ev_is (s, "rtc-call") ||
+        ev_is (s, "rtc-stats")     || ev_is (s, "rtc-error") ||
+        ev_is (s, "sdp")           ||
+        ev_is (s, "page-error")    || ev_is (s, "page-reject") ||
         ev_is (s, "rtc-state")     || ev_is (s, "rtc-trace-on") ||
         ev_is (s, "rtc-caps")      || ev_is (s, "send-params-fixed") ||
         ev_is (s, "params-fix-on") || ev_is (s, "sdp-ssrc-verify") ||
-        ev_is (s, "cam-scaled")    || ev_is (s, "cam-scale-error") ||
-        ev_is (s, "cam-scale-skip")|| ev_is (s, "compat-orientation") ||
-        ev_is (s, "cam-scale-mode")|| ev_is (s, "gum-nomic") ||
+        ev_is (s, "compat-orientation") || ev_is (s, "gum-nomic") ||
         ev_is (s, "compat-error")  ||
         ev_is (s, "media-stall")|| ev_is (s, "media-reload") ||
         ev_is (s, "media-dump") || ev_is (s, "warm-ok") ||
@@ -1410,6 +1833,40 @@ on_script_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
      * process could not reach them, which on a desktop means the portal,
      * and the portal needs a working D-Bus.
      */
+    /*
+     * WebKit picks the video encoder when the local description is set:
+     * the first codec of its own offer that it can encode
+     * (linkOutgoingSources -> configurePacketizers). The answer comes
+     * later and is not consulted again - codecPreferencesChanged refuses
+     * once the pipeline runs. So an answer that settles on another codec
+     * gets packets it cannot decode: the far end shows a spinner while
+     * our side reports megabytes sent.
+     */
+    if (ev_is (s, "codec-mismatch")) {
+        char *mine = json_str (s, "sending"), *theirs = json_str (s, "agreed");
+        mlog ("webrtc: the far end agreed to %s, but WebKit encodes %s - the",
+              theirs ? theirs : "?", mine ? mine : "?");
+        mlog ("webrtc: first codec of its own offer - and does not switch.");
+        mlog ("webrtc: The far end cannot decode that. --video-codecs %s",
+              theirs ? theirs : "VP8");
+        mlog ("webrtc: puts %s first in the offer, so both sides match.",
+              theirs ? theirs : "VP8");
+        g_free (mine); g_free (theirs);
+    }
+
+    /*
+     * WebKit writes no a=ssrc lines, so --sdp-ssrc-fix adds one for sites
+     * that read the SSRC out of the SDP (mediasoup). A made-up number
+     * would be announced to the server while WebKit sends another, and
+     * the server drops every packet. So the made-up one is swapped for
+     * the one WebKit really uses, read from its own stats.
+     */
+    if (ev_is (s, "ssrc-real-missing")) {
+        mlog ("webrtc: could not learn the real SSRC within 15s; the site was");
+        mlog ("webrtc: told a made-up one, and a server that trusts it (mediasoup)");
+        mlog ("webrtc: will drop this stream.");
+    }
+
     if (ev_is (s, "gum-drop-audio"))
         mlog ("camera: no microphone here, retrying for video alone");
 
@@ -1426,11 +1883,11 @@ on_script_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
         else
             mlog ("camera: --prewarm will say whether the devices are visible here");
 
-        mlog ("camera: the web process reaches devices through the desktop portal;");
-        mlog ("camera: with no portal, --no-sandbox lets it open them directly.");
-        mlog ("camera: a portal needs D-Bus, which needs a machine id:");
-        mlog ("camera:   dbus-uuidgen --ensure=/etc/machine-id   (no systemd needed)");
-        mlog ("camera:   dbus-run-session -- browser-big URL");
+        mlog ("camera: WebKit lists cameras with GStreamer's device monitor, so");
+        mlog ("camera: v4l2deviceprovider (gst-plugins-good) must be installed and");
+        mlog ("camera: /dev/video* readable by this user (group video).");
+        mlog ("camera: only a PipeWire >= 0.3.64 provider makes it ask the camera");
+        mlog ("camera: portal instead; a bubblewrap sandbox needs --no-sandbox.");
     }
 
     if (ev_is (s, "warm-page-done")) {
@@ -1515,11 +1972,15 @@ static char *
 build_shim (void)
 {
     char *match = js_quote (g_cam_match);
+    char *micmatch = js_quote (g_mic_match);
 
     /* ["VP8","VP9"] from a comma separated list */
     GString *cj = g_string_new ("[");
-    if (g_video_codecs) {
-        char **v = g_strsplit (g_video_codecs, ",", -1);
+    /* VP8 first by default: WebKit keeps encoding the first codec of its
+     * own offer, and VP8 is what SFUs answer. "native" leaves the order. */
+    const char *vc = g_codecs_set ? g_video_codecs : "VP8";
+    if (vc) {
+        char **v = g_strsplit (vc, ",", -1);
         for (int i = 0; v[i]; i++) {
             char *t = g_strstrip (g_strdup (v[i]));
             if (*t)
@@ -1532,33 +1993,32 @@ build_shim (void)
     char *codecs_js = g_string_free (cj, FALSE);
     char *cfg   = g_strdup_printf (
         "window.__bbCfg={camfix:%s,relax:%s,cache:%s,dropAudio:%s,retries:%d,"
-        "maxW:%d,maxH:%d,maxFps:%d,forceW:%d,forceH:%d,forceFps:%d,holdMs:%d,"
-        "forceExact:%s,ssrcFix:%s,codecs:%s,rtcTrace:%s,paramsFix:%s,scale:%s,"
-        "compat:%s,scaleFps:%d,noMic:%s,"
-        "match:%s,watchdog:%s,stall:%d,debug:%s};",
+        "maxW:%d,maxH:%d,maxFps:%d,"
+        "ssrcFix:%s,codecs:%s,rtcTrace:%s,paramsFix:%s,silentSplit:%s,"
+        "compat:%s,noMic:%s,fpsLoose:%s,"
+        "match:%s,micMatch:%s,watchdog:%s,stall:%d,debug:%s};",
         g_cam_fix        ? "true" : "false",
         (g_cam_repair && g_cam_relax)      ? "true" : "false",
         (g_cam_repair && g_cam_keepalive)  ? "true" : "false",
         (g_cam_repair && g_cam_drop_audio) ? "true" : "false",
         g_cam_repair ? g_cam_retries : 0,
         g_cam_max_w, g_cam_max_h, g_cam_max_fps,
-        g_cam_force_w, g_cam_force_h, g_cam_force_fps, g_cam_hold_ms,
-        g_cam_force_exact ? "true" : "false",
         g_sdp_ssrc_fix    ? "true" : "false",
         codecs_js,
         g_rtc_trace       ? "true" : "false",
         g_rtc_params_fix  ? "true" : "false",
-        g_cam_scale       ? "true" : "false",
+        g_silent_split    ? "true" : "false",
         g_web_compat      ? "true" : "false",
-        g_cam_scale_fps,
         g_no_mic          ? "true" : "false",
-        match,
+        g_fps_loose       ? "true" : "false",
+        match, micmatch,
         g_media_watchdog ? "true" : "false",
         g_stall_timeout,
         g_shim_debug     ? "true" : "false");
 
     char *js = g_strconcat (cfg, SHIM_JS, NULL);
     g_free (match);
+    g_free (micmatch);
     g_free (codecs_js);
     g_free (cfg);
     return js;
@@ -1652,11 +2112,11 @@ capture_check (gpointer u)
 
     mlog ("capture: permission was granted but nothing started capturing.");
     mlog ("capture: run --list-cameras to see the devices this build can reach;");
-    mlog ("capture: an empty list means the web process cannot get at them -");
-    mlog ("capture:   --no-sandbox      opens them without the desktop portal");
-    mlog ("capture:   --prewarm         says what GStreamer can see from here");
-    mlog ("capture: a camera but no microphone is usually a sound server with");
-    mlog ("capture: no card; audio = alsa in the config bypasses it.");
+    mlog ("capture: an empty list means GStreamer cannot see them from here -");
+    mlog ("capture:   --prewarm         lists cameras and microphones as WebKit sees them");
+    mlog ("capture:   --gst-debug webkitcapture*:5   WebKit's own capture log");
+    mlog ("capture: a camera but no microphone means no alsa/pulse device provider");
+    mlog ("capture: found a capture device (gst-device-monitor-1.0 Audio/Source).");
     return G_SOURCE_REMOVE;
 }
 
@@ -1755,10 +2215,8 @@ big_usage_options (GString *s)
 {
     g_string_append_printf (s,
 "camera and video:\n"
-"  Nothing in this section is on unless you ask for it. By default the\n"
-"  browser is plain WebKitGTK: no shim over getUserMedia, no device probe,\n"
-"  no watchdogs, no reloads of its own. Reach for these when a site\n"
-"  misbehaves, not before.\n"
+"  Off unless asked for: no device probe, no watchdogs, no reloads of\n"
+"  its own, and the page's camera constraints pass through untouched.\n"
 "\n"
 "  --fix-media         --cam-fix, --prewarm, --media-watchdog and\n"
 "                      --auto-reload together\n"
@@ -1791,33 +2249,22 @@ big_usage_options (GString *s)
 "  --no-cam-drop-audio with --cam-fix, fail instead of handing a site\n"
 "                      video only when the machine has no microphone\n"
 "  --cam-max WxH@FPS   cap relaxed constraints (default: %dx%d@%d)\n"
+"  --no-cam-size-fix   pass a page's soft frameRate limit on to WebKit. By\n"
+"                      default it is dropped: WebKit only picks camera\n"
+"                      modes that list that exact rate, so {max: 20} turns\n"
+"                      a 4:3 request into a letterboxed 16:9 mode\n"
+"                      (cam_size_fix = no)\n"
 "  --no-mic            give pages the camera but never the microphone. A\n"
 "                      diagnostic: if a freeze goes away, the audio path\n"
 "                      is the cause (the audio track here reports\n"
 "                      sampleRate 0, which is not a valid rate)\n"
-"  --web-compat        supply APIs WebKitGTK does not implement, currently\n"
-"                      screen.orientation. Zoom's media code reads\n"
-"                      screen.orientation.type and throws without it\n"
-"  --cam-scale         deliver the size the page asked for by scaling the\n"
-"                      camera through a canvas. WebKit picks the nearest\n"
-"                      native mode instead of scaling, so a site that\n"
-"                      needs 320x240 is handed 848x480 and refuses it.\n"
-"                      Scaling happens on the page's own thread, so the\n"
-"                      rate is capped (default 15)\n"
-"  --cam-scale-fps N   raise or lower that cap\n"
-"  --cam-exact WxH@FPS demand this size exactly, whatever the page asked.\n"
-"                      A bare width in a page's constraints is only a\n"
-"                      preference and WebKit may answer with another size;\n"
-"                      this refuses anything else. Fails outright if the\n"
-"                      camera cannot do it, which is the honest answer\n"
-"  --cam-force WxH@FPS ask for this size and aspect ratio whatever the page\n"
-"                      requested, e.g. 640x480@30 for 4:3. Implies\n"
-"                      --cam-fix. Use when a site negotiates a shape the\n"
-"                      camera answers badly\n"
+"  --web-compat        turn on WebKit's ScreenOrientationAPI feature, which\n"
+"                      is built but off on GTK, and if a page still sees no\n"
+"                      screen.orientation, supply a static one. Zoom's media\n"
+"                      code reads screen.orientation.type and throws without it\n"
 "  --cam-match TEXT    prefer the camera whose label contains TEXT\n"
-"  --cam-hold SEC      how long a shared capture is held after the page\n"
-"                      has stopped using it (default: 3). The camera light\n"
-"                      stays on for this long; 0 releases at once\n"
+"  --mic-match TEXT    prefer the microphone whose label contains TEXT, for\n"
+"                      pages that just take the first one (mic_match)\n"
 "  --cam-retries N     retries with looser constraints (default: %d)\n"
 "\n"
 "video:\n"
@@ -1828,11 +2275,16 @@ big_usage_options (GString *s)
 "                      default: %d)\n"
 "  --max-reloads N     auto-reloads per URL (default: %d)\n"
 
+"  --ice-rice          use WebKit's own librice ICE agent instead of the\n"
+"                      default libnice one. librice finds no public address\n"
+"                      here (a DNS/IPv6 FIXME in its STUN code), so calls\n"
+"                      over the internet fail. ice = rice in the config\n"
 "  --no-webrtc         disable WebRTC only\n"
 "  --no-mediastream    disable MediaStream / getUserMedia only\n"
 "\n"
-"webrtc:\n"
-"  --fix-webrtc        --sdp-ssrc-fix and --rtc-params-fix together\n"
+"webrtc (the repairs below are on by default):\n"
+"  --no-fix-webrtc     turn off --sdp-ssrc-fix, --rtc-params-fix and the\n"
+"                      silent-audio split at once (fix_webrtc = no)\n"
 "  --rtc-params-fix    supply RTCRtpSendParameters.codecs when a library\n"
 "                      omits it. WebKit requires it and Firefox does not,\n"
 "                      so a library on its Firefox path throws\n"
@@ -1841,12 +2293,12 @@ big_usage_options (GString *s)
 "                      made, tracks attached, offer created, answer set -\n"
 "                      so the last one logged is the step that failed.\n"
 "                      Included in --media-trace\n"
-"  --sdp-ssrc-fix      add the a=ssrc cname lines WebKit leaves out, which\n"
-"                      a site parsing the offer needs - without them it\n"
-"                      throws \"CNAME value not found\" and never connects\n"
-"  --video-codecs LIST preferred codec order for sending, e.g. VP8 or\n"
-"                      VP8,VP9. Use it when WebKit offers something this\n"
-"                      machine has no encoder for\n"
+"  --sdp-ssrc-fix      add the a=ssrc lines WebKit leaves out, then tell the\n"
+"                      server the SSRC and payload type WebKit really sends\n"
+"                      (mediasoup drops the stream otherwise)\n"
+"  --video-codecs LIST sending codec order (default: VP8). WebKit keeps\n"
+"                      encoding the first codec of its own offer, whatever\n"
+"                      the far end answers. native keeps WebKit's order\n"
 "\n"
 "diagnostics:\n"
 "  --media-trace       log every getUserMedia call, the constraints it\n"
@@ -1857,11 +2309,11 @@ big_usage_options (GString *s)
 "                      (a missing GStreamer plugin is always reported,\n"
 "                      since pages fail in confusing ways without one)\n"
 "  --audio-pulse       undo audio=alsa from a config file for this run\n"
-"  --audio-alsa        play and record through ALSA rather than PulseAudio,\n"
-"                      by ranking the pulse elements out. Fixes browser\n"
-"                      audio when the Pulse server has a dummy sink.\n"
-"                      Enumeration is a separate matter: device provider\n"
-"                      ranks cannot be overridden, so a microphone still\n"
+"  --audio-alsa        play through ALSA rather than PulseAudio, by\n"
+"                      ranking pulsesink out. Fixes browser audio when\n"
+"                      the Pulse server has a dummy sink. Microphones are\n"
+"                      a separate matter: GStreamer ignores ranks for\n"
+"                      device providers, so a microphone still\n"
 "                      needs alsadeviceprovider installed - check with\n"
 "                      gst-inspect-1.0 alsadeviceprovider\n"
 "                      Put audio = alsa in a config file to have this\n"
@@ -1936,7 +2388,8 @@ big_parse_arg (int argc, char **argv, int *i)
 
     if (!strcmp (a, "--warm-timeout")) {
         NEXT ("--warm-timeout");
-        g_warm_timeout = MAX (1, atoi (argv[++(*i)]));
+        const char *v = argv[++(*i)];
+        g_warm_timeout = MAX (1, atoi (v));
         return TRUE;
     }
     if (!strcmp (a, "--no-mic")) {
@@ -1949,53 +2402,7 @@ big_parse_arg (int argc, char **argv, int *i)
         g_web_compat = TRUE;
         g_cam_fix    = TRUE;           /* it rides in the same shim */
         g_cam_relax  = FALSE;
-        return TRUE;
-    }
-    if (!strcmp (a, "--cam-scale-fps")) {
-        NEXT ("--cam-scale-fps");
-        g_cam_scale_fps = CLAMP (atoi (argv[++(*i)]), 1, 60);
-        g_cam_scale = g_cam_fix = TRUE;
-        g_cam_relax = FALSE;
-        return TRUE;
-    }
-    if (!strcmp (a, "--cam-scale")) {
-        g_cam_scale = TRUE;
-        g_cam_fix   = TRUE;
-        g_cam_relax = FALSE;           /* the page's size is the point */
-        return TRUE;
-    }
-    if (!strcmp (a, "--cam-exact")) {
-        /*
-         * exact, not ideal. A bare width/height in a page's constraints is
-         * only a preference and WebKit is free to answer with another
-         * size - which it does, so a site that publishes at the size it
-         * asked for gets a stream it cannot use.
-         */
-        NEXT ("--cam-exact");
-        int sw = g_cam_max_w, sh = g_cam_max_h, sf = g_cam_max_fps;
-        if (!parse_cam_max (argv[++(*i)])) {
-            g_printerr ("%s: bad --cam-exact %s (want WxH@FPS)\n", argv[0], argv[*i]);
-            exit (1);
-        }
-        g_cam_force_w = g_cam_max_w;  g_cam_force_h = g_cam_max_h;
-        g_cam_force_fps = g_cam_max_fps;
-        g_cam_max_w = sw; g_cam_max_h = sh; g_cam_max_fps = sf;
-        g_cam_force_exact = TRUE;
-        g_cam_fix = TRUE;
-        g_cam_relax = FALSE;           /* relaxing would undo the point */
-        return TRUE;
-    }
-    if (!strcmp (a, "--cam-force")) {
-        NEXT ("--cam-force");
-        int sw = g_cam_max_w, sh = g_cam_max_h, sf = g_cam_max_fps;
-        if (!parse_cam_max (argv[++(*i)])) {
-            g_printerr ("%s: bad --cam-force %s (want WxH@FPS)\n", argv[0], argv[*i]);
-            exit (1);
-        }
-        g_cam_force_w = g_cam_max_w;  g_cam_force_h = g_cam_max_h;
-        g_cam_force_fps = g_cam_max_fps;
-        g_cam_max_w = sw; g_cam_max_h = sh; g_cam_max_fps = sf;
-        g_cam_fix = TRUE;              /* it is applied by the shim */
+        feature_request ("ScreenOrientationAPI");   /* WebKit has it, off on GTK */
         return TRUE;
     }
     if (!strcmp (a, "--cam-max")) {
@@ -2010,16 +2417,20 @@ big_parse_arg (int argc, char **argv, int *i)
         NEXT ("--cam-match");
         g_free (g_cam_match);
         g_cam_match = g_strdup (argv[++(*i)]);
+        g_cam_fix   = TRUE;
         return TRUE;
     }
-    if (!strcmp (a, "--cam-hold")) {
-        NEXT ("--cam-hold");
-        g_cam_hold_ms = MAX (0, atoi (argv[++(*i)])) * 1000;
+    if (!strcmp (a, "--mic-match")) {
+        NEXT ("--mic-match");
+        g_free (g_mic_match);
+        g_mic_match = g_strdup (argv[++(*i)]);
+        g_cam_fix   = TRUE;            /* it rides in the same shim */
         return TRUE;
     }
     if (!strcmp (a, "--cam-retries")) {
         NEXT ("--cam-retries");
-        g_cam_retries = CLAMP (atoi (argv[++(*i)]), 0, 3);
+        const char *v = argv[++(*i)];
+        g_cam_retries = CLAMP (atoi (v), 0, 3);
         return TRUE;
     }
 
@@ -2031,17 +2442,20 @@ big_parse_arg (int argc, char **argv, int *i)
 
     if (!strcmp (a, "--stall-timeout")) {
         NEXT ("--stall-timeout");
-        g_stall_timeout = MAX (2, atoi (argv[++(*i)]));
+        const char *v = argv[++(*i)];
+        g_stall_timeout = MAX (2, atoi (v));
         return TRUE;
     }
     if (!strcmp (a, "--load-timeout")) {
         NEXT ("--load-timeout");
-        g_load_timeout = MAX (0, atoi (argv[++(*i)]));
+        const char *v = argv[++(*i)];
+        g_load_timeout = MAX (0, atoi (v));
         return TRUE;
     }
     if (!strcmp (a, "--max-reloads")) {
         NEXT ("--max-reloads");
-        g_max_reloads = MAX (0, atoi (argv[++(*i)]));
+        const char *v = argv[++(*i)];
+        g_max_reloads = MAX (0, atoi (v));
         return TRUE;
     }
 
@@ -2052,11 +2466,14 @@ big_parse_arg (int argc, char **argv, int *i)
         g_cam_relax      = FALSE;
         return TRUE;
     }
-    if (!strcmp (a, "--fix-webrtc")) {     /* both offer repairs at once */
-        g_rtc_params_fix = TRUE;
-        g_sdp_ssrc_fix   = TRUE;
-        g_cam_fix        = TRUE;
-        g_cam_relax      = FALSE;
+    if (!strcmp (a, "--fix-webrtc")) {     /* the default; kept for old scripts */
+        set_fix_webrtc (TRUE);
+        g_cam_fix = TRUE;
+        return TRUE;
+    }
+    if (!strcmp (a, "--no-fix-webrtc"))  { set_fix_webrtc (FALSE); return TRUE; }
+    if (!strcmp (a, "--no-cam-size-fix") || !strcmp (a, "--no-framerate-fix")) {
+        g_fps_loose = FALSE;
         return TRUE;
     }
     if (!strcmp (a, "--rtc-trace")) {
@@ -2074,8 +2491,7 @@ big_parse_arg (int argc, char **argv, int *i)
     }
     if (!strcmp (a, "--video-codecs")) {
         NEXT ("--video-codecs");
-        g_free (g_video_codecs);
-        g_video_codecs = g_strdup (argv[++(*i)]);
+        set_video_codecs (argv[++(*i)]);
         g_cam_fix   = TRUE;
         g_cam_relax = FALSE;
         return TRUE;
@@ -2103,21 +2519,11 @@ big_parse_arg (int argc, char **argv, int *i)
         return TRUE;
     }
 
-    if (!strcmp (a, "--audio-pulse")) { g_clear_pointer (&g_gst_rank, g_free); return TRUE; }
+    if (!strcmp (a, "--audio-pulse")) { g_audio_alsa = FALSE; return TRUE; }
+    if (!strcmp (a, "--ice-libnice")) { g_ice_libnice = TRUE;  return TRUE; }
+    if (!strcmp (a, "--ice-rice"))    { g_ice_libnice = FALSE; return TRUE; }
     if (!strcmp (a, "--audio-alsa")) {
-        /*
-         * Rank PulseAudio's elements out so autoaudiosink/autoaudiosrc
-         * pick ALSA. This fixes playback on a machine whose Pulse server
-         * came up with a dummy sink.
-         *
-         * It does NOT change which devices are enumerated:
-         * GST_PLUGIN_FEATURE_RANK is honoured for elements but ignored for
-         * device providers, so the microphone still depends on
-         * alsadeviceprovider being installed. Checked, not assumed.
-         */
-        gst_rank_add ("pulsesink:NONE,pulsesrc:NONE,"
-                      "alsasink:PRIMARY,alsasrc:PRIMARY,"
-                      "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY");
+        g_audio_alsa = TRUE;
         return TRUE;
     }
     if (!strcmp (a, "--no-va")) {
@@ -2183,6 +2589,26 @@ big_parse_arg (int argc, char **argv, int *i)
  * setting for a machine with no working sound server, and that is a
  * property of the machine, so it belongs in that machine's config.
  */
+/* --video-codecs / video_codecs: a list, or native for WebKit's own order */
+static void
+set_video_codecs (const char *v)
+{
+    g_free (g_video_codecs);
+    g_video_codecs = NULL;
+    g_codecs_set   = TRUE;
+    if (v && *v && g_ascii_strcasecmp (v, "native") && g_ascii_strcasecmp (v, "none"))
+        g_video_codecs = g_strdup (v);
+}
+
+/* fix_webrtc = no / --no-fix-webrtc: every call repair off at once */
+static void
+set_fix_webrtc (gboolean on)
+{
+    g_sdp_ssrc_fix   = on;
+    g_rtc_params_fix = on;
+    g_silent_split   = on;
+}
+
 /* the core keeps its own truthy(); this is browser-big's copy */
 static gboolean
 truthy_value (const char *v)
@@ -2197,17 +2623,50 @@ big_cfg_set (const char *key, const char *value)
     /*
      * cam_share = yes
      *
-     * WebKitGTK does not multiplex one camera across two getUserMedia
-     * calls the way Chrome and Firefox do, so a page that asks twice gets
-     * a second track that never delivers a frame. Sharing hands the
-     * repeated request a clone of the live track over the single open,
-     * which is what the other engines do internally.
+     * A page that opens the same camera twice gets the live track a
+     * second time instead of a second capture, with stop() counted, which
+     * is what the other engines do internally.
      */
     if (!g_ascii_strcasecmp (key, "web_compat")) {
         if (truthy_value (value)) {
             g_web_compat = TRUE;
             g_cam_fix    = TRUE;
             g_cam_relax  = FALSE;
+            feature_request ("ScreenOrientationAPI");
+        }
+        return TRUE;
+    }
+
+    /* the sending codec order: VP8 first matches what most SFUs answer */
+    if (!g_ascii_strcasecmp (key, "video_codecs")) {
+        set_video_codecs (value);
+        g_cam_fix = TRUE;              /* it rides in the same shim */
+        g_cam_relax = FALSE;
+        return TRUE;
+    }
+
+    if (!g_ascii_strcasecmp (key, "cam_match") || !g_ascii_strcasecmp (key, "mic_match")) {
+        char **dst = g_ascii_tolower (key[0]) == 'c' ? &g_cam_match : &g_mic_match;
+        g_free (*dst);
+        *dst = g_strdup (value);
+        g_cam_fix = TRUE;
+        return TRUE;
+    }
+
+    if (!g_ascii_strcasecmp (key, "sdp_ssrc_fix")) {
+        if (truthy_value (value)) {
+            g_sdp_ssrc_fix = TRUE;
+            g_cam_fix      = TRUE;     /* it rides in the same shim */
+            g_cam_relax    = FALSE;
+        }
+        return TRUE;
+    }
+
+    if (!g_ascii_strcasecmp (key, "rtc_params_fix")) {
+        if (truthy_value (value)) {
+            g_rtc_params_fix = TRUE;
+            g_cam_fix        = TRUE;
+            g_cam_relax      = FALSE;
         }
         return TRUE;
     }
@@ -2223,16 +2682,33 @@ big_cfg_set (const char *key, const char *value)
         return TRUE;
     }
 
+    if (!g_ascii_strcasecmp (key, "cam_size_fix") || !g_ascii_strcasecmp (key, "framerate_fix")) {
+        g_fps_loose = truthy_value (value);
+        return TRUE;
+    }
+
+    if (!g_ascii_strcasecmp (key, "fix_webrtc")) {
+        set_fix_webrtc (truthy_value (value));
+        return TRUE;
+    }
+
+    if (!g_ascii_strcasecmp (key, "ice")) {
+        if (!g_ascii_strcasecmp (value, "libnice"))      g_ice_libnice = TRUE;
+        else if (!g_ascii_strcasecmp (value, "rice") ||
+                 !g_ascii_strcasecmp (value, "librice") ||
+                 !g_ascii_strcasecmp (value, "auto"))   g_ice_libnice = FALSE;
+        else g_printerr ("config: ice must be rice or libnice\n");
+        return TRUE;
+    }
+
     if (g_ascii_strcasecmp (key, "audio") != 0)
         return FALSE;
 
     if (!g_ascii_strcasecmp (value, "alsa")) {
-        gst_rank_add ("pulsesink:NONE,pulsesrc:NONE,"
-                      "alsasink:PRIMARY,alsasrc:PRIMARY,"
-                      "pulsedeviceprovider:NONE,alsadeviceprovider:PRIMARY");
+        g_audio_alsa = TRUE;
     } else if (!g_ascii_strcasecmp (value, "pulse") ||
                !g_ascii_strcasecmp (value, "auto")) {
-        g_clear_pointer (&g_gst_rank, g_free);
+        g_audio_alsa = FALSE;
     } else {
         g_printerr ("config: audio must be alsa, pulse or auto\n");
     }
@@ -2257,9 +2733,31 @@ big_pre_gtk (void)
         g_setenv ("GST_DEBUG", s, TRUE);
         g_free (s);
     }
-    if (g_gst_rank) {
-        g_setenv ("GST_PLUGIN_FEATURE_RANK", g_gst_rank, TRUE);
-        mlog ("gstreamer: GST_PLUGIN_FEATURE_RANK=%s", g_gst_rank);
+    /*
+     * audio = alsa. WebKit plays through autoaudiosink, which takes the
+     * highest ranked sink, so ranking pulsesink out is all it takes.
+     * Capture is different: WebKit opens the GstDevice the device monitor
+     * found (gst_device_create_element), so the pulsesrc/alsasrc ranks do
+     * not matter there, and GStreamer applies GST_PLUGIN_FEATURE_RANK to
+     * element factories only - device provider entries are ignored
+     * (gstpluginfeature.c, GStreamer 1.28).
+     */
+    if (g_audio_alsa)
+        gst_rank_add ("pulsesink:NONE");
+    if (g_gst_rank)
+        gst_rank_env_add (g_gst_rank);    /* append: core and user may have set it */
+    if (g_getenv ("GST_PLUGIN_FEATURE_RANK"))
+        mlog ("gstreamer: GST_PLUGIN_FEATURE_RANK=%s", g_getenv ("GST_PLUGIN_FEATURE_RANK"));
+    /*
+     * Which ICE agent WebKit hands webrtcbin (GStreamerMediaEndpoint.cpp,
+     * 2.52+): by default its own librice agent, whose sockets, STUN, TURN
+     * and DNS lookups live in the network process. With this variable set
+     * WebKit creates a plain webrtcbin, which uses libnice inside the web
+     * process - the older, well-trodden path. Both need libgstnice.
+     */
+    if (g_ice_libnice) {
+        g_setenv ("WEBKIT_GST_DISABLE_WEBRTC_NETWORK_SANDBOX", "1", TRUE);
+        mlog ("webrtc: ICE through libnice in the web process (ice = rice to undo)");
     }
     if (g_gst_dbgfile)    g_setenv ("GST_DEBUG_FILE", g_gst_dbgfile, TRUE);
     if (g_webkit_dbg)     g_setenv ("WEBKIT_DEBUG", g_webkit_dbg, TRUE);
@@ -2270,93 +2768,127 @@ big_pre_gtk (void)
  * plugin looks like a broken site rather than a missing package. Silent
  * when everything needed is present.
  */
+static gboolean
+have_element (const char *name)
+{
+    GstElementFactory *f = gst_element_factory_find (name);
+    if (f) gst_object_unref (f);
+    return f != NULL;
+}
+
+static gboolean
+have_any_element (const char *const *names)
+{
+    for (int i = 0; names[i]; i++)
+        if (have_element (names[i]))
+            return TRUE;
+    return FALSE;
+}
+
+static gboolean
+have_provider (const char *name)
+{
+    GstDeviceProviderFactory *f = gst_device_provider_factory_find (name);
+    if (f) gst_object_unref (f);
+    return f != NULL;
+}
+
 static void
 codec_check (void)
 {
     /*
-     * webrtcbin alone is not enough: a call also needs ICE from libnice,
-     * SRTP, DTLS and the RTP manager. Naming each one separately turns
-     * "WebRTC does not work" into a shopping list.
+     * What the sources demand, not a guess:
+     *
+     * webrtcbin (gst-plugins-bad 1.28, gstwebrtcbin.c) refuses to leave
+     * NULL unless nicesrc/nicesink and dtlsenc/dtlsdec are in the
+     * registry - whichever ICE agent it was given, so WebKit's librice
+     * agent does not lift the libnice requirement - and creates no data
+     * channel without sctpenc/sctpdec. rtpbin is looked up by name in
+     * WebKit's GStreamerMediaEndpoint.cpp.
+     *
+     * Capture (GStreamerVideoCapturer.cpp): source -> decodebin3 ->
+     * videoconvert -> videoscale -> videorate -> capsfilter. Cameras come
+     * from the device monitor, i.e. v4l2deviceprovider, unless a PipeWire
+     * provider and a camera portal exist; microphones from alsa/pulse
+     * device providers.
      */
     static const struct { const char *element; const char *what; } need[] = {
-        { "webrtcbin",   "WebRTC             gst-plugins-bad, built with libnice" },
+        { "webrtcbin",   "WebRTC             gst-plugins-bad (webrtc plugin)" },
+        { "nicesrc",     "ICE                libnice's GStreamer plugin (libgstnice)" },
+        { "nicesink",    "ICE                libnice's GStreamer plugin (libgstnice)" },
+        { "dtlsenc",     "DTLS               gst-plugins-bad, needs OpenSSL" },
+        { "dtlsdec",     "DTLS               gst-plugins-bad, needs OpenSSL" },
+        { "dtlssrtpenc", "DTLS-SRTP          gst-plugins-bad" },
+        { "dtlssrtpdec", "DTLS-SRTP          gst-plugins-bad" },
         { "srtpenc",     "SRTP               gst-plugins-bad, needs libsrtp2" },
-        { "dtlssrtpenc", "DTLS               gst-plugins-bad, needs OpenSSL" },
-        { "rtpbin",      "RTP                gst-plugins-good" },
-        { "vp8dec",      "VP8 video          gst-plugins-good, needs libvpx" },
+        { "srtpdec",     "SRTP               gst-plugins-bad, needs libsrtp2" },
+        { "sctpenc",     "data channels      gst-plugins-bad (sctp plugin)" },
+        { "sctpdec",     "data channels      gst-plugins-bad (sctp plugin)" },
+        { "rtpbin",      "RTP                gst-plugins-good (rtpmanager)" },
+        { "rtpfunnel",   "RTP                gst-plugins-good (rtpmanager)" },
+        { "rtpopuspay",  "Opus over RTP      gst-plugins-good (rtp)" },
+        { "rtpopusdepay","Opus over RTP      gst-plugins-good (rtp)" },
+        { "rtpvp8pay",   "VP8 over RTP       gst-plugins-good (rtp)" },
+        { "rtpvp8depay", "VP8 over RTP       gst-plugins-good (rtp)" },
+        { "rtph264pay",  "H.264 over RTP     gst-plugins-good (rtp)" },
+        { "rtph264depay","H.264 over RTP     gst-plugins-good (rtp)" },
+        { "opusenc",     "Opus audio         gst-plugins-base, needs libopus" },
         { "opusdec",     "Opus audio         gst-plugins-base, needs libopus" },
-        { "avdec_h264",  "H.264 video        gst-libav" },
-        { "avdec_aac",   "AAC audio          gst-libav" },
+        { "vp8enc",      "VP8 video          gst-plugins-good, needs libvpx" },
+        { "vp8dec",      "VP8 video          gst-plugins-good, needs libvpx" },
+        { "audioconvert","audio              gst-plugins-base" },
+        { "audioresample","audio             gst-plugins-base" },
+        { "audiomixer",  "audio              gst-plugins-base" },
+        { "videoconvert","capture            gst-plugins-base" },
+        { "videoscale",  "capture            gst-plugins-base" },
+        { "videorate",   "capture            gst-plugins-base" },
+        { "decodebin3",  "capture            gst-plugins-base (playback)" },
+        { "autoaudiosink","playback          gst-plugins-good (autodetect)" },
     };
     GString *missing = g_string_new (NULL);
 
-    for (gsize i = 0; i < G_N_ELEMENTS (need); i++) {
-        GstElementFactory *f = gst_element_factory_find (need[i].element);
-        if (f) {
-            gst_object_unref (f);
-            continue;
-        }
-        g_string_append_printf (missing, "  %-12s %s\n", need[i].element, need[i].what);
-    }
+    for (gsize i = 0; i < G_N_ELEMENTS (need); i++)
+        if (!have_element (need[i].element))
+            g_string_append_printf (missing, "  %-13s %s\n", need[i].element, need[i].what);
 
-    /* Publishing to most platforms needs H.264 out, not just in. Either
-     * encoder serves, so neither belongs in the list above. */
-    GstElementFactory *x264 = gst_element_factory_find ("x264enc");
-    GstElementFactory *oh   = gst_element_factory_find ("openh264enc");
+    /* One of each will do. The H.264 encoders are the ones WebKit's own
+     * webkitvideoencoder knows how to drive (VideoEncoderPrivateGStreamer.cpp). */
+    static const char *const h264enc[] = { "x264enc", "openh264enc", "vah264enc",
+                                           "vah264lpenc", "omxh264enc", NULL };
+    static const char *const h264dec[] = { "avdec_h264", "vah264dec", "openh264dec",
+                                           "v4l2slh264dec", "v4l2h264dec", NULL };
+    static const char *const jpegdec[] = { "jpegdec", "avdec_mjpeg", "vajpegdec", NULL };
+    static const char *const aacdec[]  = { "avdec_aac", "faad", "fdkaacdec", NULL };
 
-    if (!x264 && !oh)
-        g_string_append (missing,
-                         "  x264enc      H.264 encoding     gst-plugins-ugly,"
-                         " or openh264enc from gst-plugins-bad\n");
-    if (x264) gst_object_unref (x264);
-    if (oh)   gst_object_unref (oh);
+    if (!have_any_element (h264enc))
+        g_string_append (missing, "  H.264 enc     x264enc (gst-plugins-ugly), openh264enc (-bad)"
+                                  " or vah264enc (-bad, VA-API)\n");
+    if (!have_any_element (h264dec))
+        g_string_append (missing, "  H.264 dec     avdec_h264 (gst-libav) or vah264dec (-bad, VA-API)\n");
+    if (!have_any_element (aacdec))
+        g_string_append (missing, "  AAC dec       avdec_aac (gst-libav) - MP4 sites, not WebRTC\n");
 
-    /*
-     * webrtcbin existing is not the same as it working. Without an ICE
-     * agent it gathers no candidates and createAnswer() never settles -
-     * a call that hangs with no error at all. Worth building one once.
-     */
-    GstElement *wrb = gst_element_factory_make ("webrtcbin", NULL);
-    if (!wrb) {
-        g_string_append (missing, "  webrtcbin    could not be created at all\n");
-    } else {
-        GObject *agent = NULL;
-        g_object_get (wrb, "ice-agent", &agent, NULL);
-        if (!agent)
-            g_string_append (missing,
-                             "  ICE agent    webrtcbin has none: no candidates will be\n"
-                             "               gathered and createAnswer() never returns.\n"
-                             "               libnice with GStreamer support is what provides it\n");
-        else
-            g_object_unref (agent);
-        gst_object_unref (wrb);
-    }
+    if (!have_provider ("v4l2deviceprovider"))
+        g_string_append (missing, "  v4l2deviceprovider   cameras: gst-plugins-good (video4linux2)\n");
+    if (!have_provider ("alsadeviceprovider") && !have_provider ("pulsedeviceprovider") &&
+        !have_provider ("pipewiredeviceprovider"))
+        g_string_append (missing, "  alsadeviceprovider   microphones: gst-plugins-base (alsa)\n");
 
     if (missing->len) {
         mlog ("gstreamer: these are missing, and pages will fail without them:");
         g_printerr ("%s", missing->str);
     }
 
-    /*
-     * Not fatal, but WebKit complains about each one at the moment it
-     * needs it, which reads like a fault. Listed once, up front, marked
-     * for what they are.
-     */
-    static const struct { const char *element; const char *what; } nice_to_have[] = {
-        { "audiornnoise", "noise suppression   gst-plugins-rs" },
-        { "rtpgccbwe",    "RTP bandwidth est.  gst-plugins-rs" },
-    };
+    /* Not fatal, but WebKit complains about each at the moment it wants it. */
     GString *optional = g_string_new (NULL);
-
-    for (gsize i = 0; i < G_N_ELEMENTS (nice_to_have); i++) {
-        GstElementFactory *f = gst_element_factory_find (nice_to_have[i].element);
-        if (f) {
-            gst_object_unref (f);
-            continue;
-        }
-        g_string_append_printf (optional, "  %-12s %s\n",
-                                nice_to_have[i].element, nice_to_have[i].what);
-    }
+    if (!have_element ("audiornnoise"))
+        g_string_append (optional, "  audiornnoise  noise suppression   gst-plugins-rs\n");
+    if (!have_element ("rtpgccbwe"))
+        g_string_append (optional, "  rtpgccbwe     bandwidth estimation gst-plugins-rs\n");
+    if (!have_any_element (jpegdec))
+        g_string_append (optional, "  jpegdec       MJPEG cameras       gst-plugins-good (jpeg)\n");
+    if (!have_element ("vp9enc") || !have_element ("vp9dec"))
+        g_string_append (optional, "  vp9enc/dec    VP9 video           gst-plugins-good, libvpx\n");
 
     if (optional->len) {
         mlog ("gstreamer: these are optional - pages work without them:");
@@ -2432,6 +2964,8 @@ cam_list (void)
         gst_object_unref (mon);
         return;
     }
+    if (!device_monitor_wait_started (mon, 5000))
+        g_printerr ("cameras: device providers did not finish starting in 5 s\n");
 
     GList *devs = gst_device_monitor_get_devices (mon);
 
@@ -2456,10 +2990,6 @@ cam_list (void)
         if (props) gst_structure_free (props);
         g_free (name);
     }
-
-    if (devs)
-        g_print ("to ask for one of these whatever the page requests:\n"
-                 "    browser-big URL --cam-force 640x480@30\n");
 
     g_list_free_full (devs, gst_object_unref);
     gst_device_monitor_stop (mon);
@@ -2625,6 +3155,7 @@ big_cleanup (void)
 {
     g_free (g_shim_js);
     g_free (g_cam_match);
+    g_free (g_mic_match);
 }
 
 /* ----------------------------------------------------------------- main */
