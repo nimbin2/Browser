@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.39.0 (build …), md5 of the sources
+make version        # 4.40.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -178,13 +178,27 @@ browser-big URL --rtc-trace 2>&1 | tee /tmp/bb.log
 | `sdp` | Each description, codecs as `payload-type name` |
 | `ssrc-real`, `ssrc-ws`, `pt-fixed` | The server got the real SSRC and payload type |
 | `rtc-stats` | Every 3 s: `out-*` sent, `far-*` server report, `in-*` received |
-| `video-state` | Each `<video>`: size, frames shown |
+| `video-state` | Each `<video>`: size, `frames` shown, `dframes` since last tick |
+| `stuck: true` | On `rtc-stats` or `video-state`: counters stopped moving |
 | `video-audio-split` | A silent-audio stream shown video-only |
 | `codec-mismatch` | We encode something the far end did not agree to |
 
 - `out-video.enc` climbing, no `far-video`: the server drops our stream.
 - `in-video.dec` climbing, `video-state.frames` at 0: decoded, never shown.
 - `in-video.fir` climbing, `keys` still: no keyframe arrives.
+
+**A frozen picture, audio still playing.** Repeated samples are not
+printed, so a freeze stops the log instead of filling it. One line is
+let through when the counters stop and one when they move again:
+
+- `video-state` `stuck: true`, `dframes: 0`, `in-video.dec` climbing:
+  frames decode, the element never presents them. Our bug.
+- `in-video.bytes` climbing, `dec` flat: packets arrive, the decoder
+  does not advance. Usually codec or keyframe.
+- `rtc-stats` `stuck: true`: nothing arrives any more. The page or the
+  server stopped sending.
+
+The timestamp on the `stuck` line is when the picture froze.
 
 **Without a server:**
 `browser-big https://webrtc.github.io/samples/src/content/peerconnection/pc1/ --rtc-trace`.

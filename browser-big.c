@@ -791,9 +791,21 @@ static const char *SHIM_JS =
 "        box:Math.round(r.width)+'x'+Math.round(r.height),"
 "        shown:st.display!=='none'&&st.visibility!=='hidden'&&+st.opacity>0,"
 "        track:vt.length?(vt[0].id.slice(0,8)+' '+vt[0].readyState+(vt[0].muted?'/muted':'')):'none'};"
-"      var k=JSON.stringify(o);"
-"      if(vlast.get(v)===k)continue;"
-"      vlast.set(v,k);post(o);"
+/*
+ * The repeat filter is what makes a freeze invisible: when the picture
+ * stops, every counter stops with it, this sample is identical to the
+ * last one and nothing is printed at all - so silence means either
+ * frozen or page gone, and the two cannot be told apart. Compare the
+ * frame counter on its own and let one line through on the transition
+ * into stuck and one on the way out. A frozen element then says so
+ * once, with dframes:0, instead of going quiet.
+ */
+"      var k=JSON.stringify(o),p=vlast.get(v)||{};"
+"      o.dframes=(o.frames>=0&&p.frames>=0)?o.frames-p.frames:-1;"
+"      o.stuck=(o.dframes===0&&o.ready>=2&&!o.paused);"
+"      var rep=(k!==p.k)||(!!o.stuck!==!!p.stuck);"
+"      vlast.set(v,{k:k,frames:o.frames,stuck:o.stuck});"
+"      if(rep)post(o);"
 "    }"
 "  },3000);"
 "  try{var SD=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'srcObject');"
@@ -859,9 +871,19 @@ static const char *SHIM_JS =
 "          o['rtrack-'+rv.track.kind]={id:rv.track.id.slice(0,8),state:rv.track.readyState,muted:!!rv.track.muted};"
 "        });}catch(e){}"
 "        if(!any)return;"
-"        var key=JSON.stringify(o);"
-"        if(key===last[i])return;"          /* nothing moved, do not repeat */
-"        last[i]=key;post(o);"
+/*
+ * Same on the receive side. Hold the three counters that have to move
+ * while video is arriving and being decoded, and report the tick they
+ * stop on: bytes still climbing with dec flat is "arriving, not
+ * decoding"; both flat is "nothing arriving". Without this the stats
+ * simply stop printing at the moment they get interesting.
+ */
+"        var key=JSON.stringify(o),p=last[i]||{},iv=o['in-video'];"
+"        var rx=iv?(iv.bytes+'/'+iv.pkts+'/'+iv.dec):null;"
+"        o.stuck=(rx!==null&&rx===p.rx);"
+"        var rep=(key!==p.key)||(!!o.stuck!==!!p.stuck);"
+"        last[i]={key:key,rx:rx,stuck:o.stuck};"
+"        if(rep)post(o);"
 "      }).catch(function(e){"
 "        if(!pc.__bbStatsErr){pc.__bbStatsErr=1;"
 "          post({ev:'rtc-stats-error',pc:i,message:String((e&&e.message)||e)});}"
