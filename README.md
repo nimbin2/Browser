@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.40.0 (build …), md5 of the sources
+make version        # 4.41.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -187,18 +187,26 @@ browser-big URL --rtc-trace 2>&1 | tee /tmp/bb.log
 - `in-video.dec` climbing, `video-state.frames` at 0: decoded, never shown.
 - `in-video.fir` climbing, `keys` still: no keyframe arrives.
 
-**A frozen picture, audio still playing.** Repeated samples are not
-printed, so a freeze stops the log instead of filling it. One line is
-let through when the counters stop and one when they move again:
+**A frozen picture, audio still playing.** Grep for `stuck`. The
+receive path is checked at three points and `stuck` names the one that
+stopped:
 
-- `video-state` `stuck: true`, `dframes: 0`, `in-video.dec` climbing:
-  frames decode, the element never presents them. Our bug.
-- `in-video.bytes` climbing, `dec` flat: packets arrive, the decoder
-  does not advance. Usually codec or keyframe.
-- `rtc-stats` `stuck: true`: nothing arrives any more. The page or the
-  server stopped sending.
+| `stuck` | Where it stopped |
+| --- | --- |
+| `nothing arriving` | No bytes. Page or server stopped sending |
+| `arriving, no frame assembled` | Packets arrive, never form a frame |
+| `assembled, not decoding` | Whole frames arrive, decoder will not advance |
 
-The timestamp on the `stuck` line is when the picture froze.
+A fourth point is the element itself: `video-state` with `stuck: true`
+and `dframes: 0` while `in-video.dec` still climbs means frames decode
+and are never presented.
+
+Supporting counters on `in-video`: `recv` frames assembled (`-1` if
+WebKit does not report it), `fdrop` dropped, `jbd`/`jbe` jitter buffer
+delay and frames out, `dectime` total decode ms, `frz`/`frzms` freeze
+count and duration, `rtx` retransmits received.
+
+The timestamp on the first `stuck` line is when the picture froze.
 
 **Without a server:**
 `browser-big https://webrtc.github.io/samples/src/content/peerconnection/pc1/ --rtc-trace`.

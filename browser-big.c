@@ -846,8 +846,25 @@ static const char *SHIM_JS =
 "                         keys:s.keyFramesEncoded||0,"
 "                         limited:s.qualityLimitationReason||null,"
 "                         target:s.targetBitrate||0};}"
+/*
+ * recv is framesReceived - whole frames the depacketizer put back
+ * together - and it sits between bytes and dec. Without it a stalled
+ * stream is ambiguous: packets arriving while dec stands still can
+ * mean the frames never assemble or that they assemble and the decoder
+ * refuses them, and those have nothing to do with each other. WebKit
+ * may not report it, so -1 says "not answered" rather than zero.
+ */
 "          else if(s.type==='inbound-rtp'){any=true;"
 "            o['in-'+k]={ssrc:s.ssrc||0,bytes:s.bytesReceived||0,dec:s.framesDecoded||0,"
+"                        recv:(s.framesReceived===undefined?-1:s.framesReceived),"
+"                        asm:s.framesAssembledFromMultiplePackets||0,"
+"                        fdrop:s.framesDropped||0,fps:s.framesPerSecond||0,"
+"                        jbd:Math.round((s.jitterBufferDelay||0)*1000),"
+"                        jbe:s.jitterBufferEmittedCount||0,"
+"                        dectime:Math.round((s.totalDecodeTime||0)*1000),"
+"                        frz:s.freezeCount||0,"
+"                        frzms:Math.round((s.totalFreezesDuration||0)*1000),"
+"                        rtx:s.retransmittedPacketsReceived||0,"
 "                        keys:s.keyFramesDecoded||0,w:s.frameWidth||0,h:s.frameHeight||0,"
 "                        pkts:s.packetsReceived||0,lost:s.packetsLost||0,"
 "                        disc:s.packetsDiscarded||0,"
@@ -879,9 +896,13 @@ static const char *SHIM_JS =
  * simply stop printing at the moment they get interesting.
  */
 "        var key=JSON.stringify(o),p=last[i]||{},iv=o['in-video'];"
-"        var rx=iv?(iv.bytes+'/'+iv.pkts+'/'+iv.dec):null;"
-"        o.stuck=(rx!==null&&rx===p.rx);"
-"        var rep=(key!==p.key)||(!!o.stuck!==!!p.stuck);"
+"        var rx=iv?[iv.bytes,iv.pkts,iv.recv,iv.dec].join('/'):null;"
+"        o.stuck=false;"
+"        if(iv&&p.rx){var q=p.rx.split('/');"
+"          o.stuck=(iv.bytes==q[0])?'nothing arriving':"
+"                  (iv.recv>=0&&iv.recv==q[2])?'arriving, no frame assembled':"
+"                  (iv.dec==q[3])?'assembled, not decoding':false;}"
+"        var rep=(key!==p.key)||(String(o.stuck)!==String(p.stuck));"
 "        last[i]={key:key,rx:rx,stuck:o.stuck};"
 "        if(rep)post(o);"
 "      }).catch(function(e){"
