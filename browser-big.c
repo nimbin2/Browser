@@ -779,14 +779,23 @@ static const char *SHIM_JS =
 "  setInterval(function(){"
 "    var l=document.querySelectorAll('video');"
 "    for(var i=0;i<l.length;i++){var v=l[i];"
-"      if(!v.srcObject)continue;"
+/*
+ * Any element with a source, not just a camera: a page of muted autoplay
+ * videos is where frames actually go missing, and those carry src, not
+ * srcObject. dur and the two decimals on ct place a glitch against the
+ * loop point, which a whole-second ct could not.
+ */
+"      if(!v.srcObject&&!v.currentSrc&&!v.src)continue;"
 "      if(vids.indexOf(v)<0)vids.push(v);"
 "      var q=null;try{q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():null;}catch(e){}"
 "      var r=v.getBoundingClientRect(),st=getComputedStyle(v),vt=[];"
-"      try{vt=v.srcObject.getVideoTracks();}catch(e){}"
+"      try{vt=v.srcObject?v.srcObject.getVideoTracks():[];}catch(e){}"
 "      var o={ev:'video-state',v:vids.indexOf(v),id:v.id||v.className||'',"
 "        ready:v.readyState,paused:v.paused,w:v.videoWidth,h:v.videoHeight,"
-"        ct:Math.round(v.currentTime||0),frames:q?q.totalVideoFrames:-1,"
+"        ct:Math.round((v.currentTime||0)*100)/100,"
+"        dur:Math.round((v.duration||0)*100)/100,"
+"        loop:!!v.loop,seeking:!!v.seeking,"
+"        frames:q?q.totalVideoFrames:-1,"
 "        dropped:q?q.droppedVideoFrames:-1,"
 "        box:Math.round(r.width)+'x'+Math.round(r.height),"
 "        shown:st.display!=='none'&&st.visibility!=='hidden'&&+st.opacity>0,"
@@ -802,9 +811,10 @@ static const char *SHIM_JS =
  */
 "      var k=JSON.stringify(o),p=vlast.get(v)||{};"
 "      o.dframes=(o.frames>=0&&p.frames>=0)?o.frames-p.frames:-1;"
+"      o.ddropped=(o.dropped>=0&&p.dropped>=0)?o.dropped-p.dropped:-1;"
 "      o.stuck=(o.dframes===0&&o.ready>=2&&!o.paused);"
 "      var rep=(k!==p.k)||(!!o.stuck!==!!p.stuck);"
-"      vlast.set(v,{k:k,frames:o.frames,stuck:o.stuck});"
+"      vlast.set(v,{k:k,frames:o.frames,dropped:o.dropped,stuck:o.stuck});"
 "      if(rep)post(o);"
 "    }"
 "  },3000);"

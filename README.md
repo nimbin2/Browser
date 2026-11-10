@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.42.0 (build …), md5 of the sources
+make version        # 4.43.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -178,7 +178,7 @@ browser-big URL --rtc-trace 2>&1 | tee /tmp/bb.log
 | `sdp` | Each description, codecs as `payload-type name` |
 | `ssrc-real`, `ssrc-ws`, `pt-fixed` | The server got the real SSRC and payload type |
 | `rtc-stats` | Every 3 s: `out-*` sent, `far-*` server report, `in-*` received |
-| `video-state` | Each `<video>`: size, `frames` shown, `dframes` since last tick |
+| `video-state` | Every `<video>` with a source, camera or file: size, `ct`/`dur`, `loop`, `seeking`, `frames` shown, `dframes` and `ddropped` since last tick |
 | `stuck: true` | On `rtc-stats` or `video-state`: counters stopped moving |
 | `video-audio-split` | A silent-audio stream shown video-only |
 | `codec-mismatch` | We encode something the far end did not agree to |
