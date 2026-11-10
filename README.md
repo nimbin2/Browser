@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.44.0 (build …), md5 of the sources
+make version        # 4.45.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -101,6 +101,24 @@ microphone answers.
 `key = value`, `#` comments, colours as `RRGGBB[AA]`. The command line wins.
 Every key is also an option: `--hl=ff8800`. `-c PATH` reads one file only,
 `-n` reads none.
+
+## Safari version
+
+WebKitGTK derives the `Version/` token from its own release numbers, so
+2.54 reports `Version/60.5` - no Safari that ever shipped. Sites that
+look the version up print "Could not identify this version of Safari"
+and may take a fallback path.
+
+```
+safari_version = 18.6
+```
+
+That rewrites only the token and keeps the platform string and the rest
+of the agent as WebKit built it. `--ua-safari` instead replaces the
+whole agent with a macOS one; `--ua-chrome` and `--ua-firefox` avoid
+claiming to be Safari at all, which needs no upkeep.
+
+Nothing can keep the number current on its own - it is one line to bump.
 
 ## Patches
 

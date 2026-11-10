@@ -108,6 +108,7 @@ static char       *g_data_dir;     /* profile data dir, NULL when private */
 static char       *g_profile;      /* NULL -> "default" */
 static gboolean    g_clear_data;
 static char       *g_user_agent;
+static char       *g_safari_version;  /* rewrite only the Version/ token */
 static gboolean    g_allow_popups; /* --allow-popups: window.open without a click */
 static gboolean    g_follow_page_title = TRUE; /* see --title / --page-title */
 static char       *g_clip_cmd;     /* --clip-cmd, NULL -> wl-copy  */
@@ -2003,6 +2004,19 @@ set_str (char **dst, const char *v)
     *dst = g_strdup (v);
 }
 
+/* Digits and dots only: the value is spliced into the user agent, and a
+ * user agent is a header. */
+static gboolean
+safari_version_ok (const char *v)
+{
+    if (!v || !*v || strlen (v) > 16)
+        return FALSE;
+    for (const char *p = v; *p; p++)
+        if (!g_ascii_isdigit (*p) && *p != '.')
+            return FALSE;
+    return TRUE;
+}
+
 /* Returns FALSE for keys we do not know, so the caller can decide whether
  * that is worth a word on stderr. */
 static gboolean
@@ -2079,6 +2093,14 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "download_dir"))  { set_str (&g_download_dir, v); return TRUE; }
     if (key_is (k, "profile"))       { set_str (&g_profile, v); return TRUE; }
     if (key_is (k, "user_agent"))    { set_str (&g_user_agent, v); return TRUE; }
+    if (key_is (k, "safari_version")) {
+        if (safari_version_ok (v))
+            set_str (&g_safari_version, v);
+        else
+            g_printerr ("config: safari_version wants digits and dots, "
+                        "e.g. 18.6 - ignoring '%s'\n", v);
+        return TRUE;
+    }
     if (key_is (k, "popups"))        { g_allow_popups = !g_ascii_strcasecmp (v, "allow") || truthy (v); return TRUE; }
     if (key_is (k, "css"))           { set_str (&g_css_owned, v); g_css_path = g_css_owned; return TRUE; }
     if (key_is (k, "zoom"))          { g_zoom = CLAMP (g_ascii_strtod (v, NULL), ZOOM_MIN, ZOOM_MAX); return TRUE; }
@@ -2406,6 +2428,12 @@ usage (const char *argv0, gboolean to_stdout)
 "                      what is on disk now, then exit. Follows --profile\n"
 "                      and --private wherever they sit on the line\n"
 "  --user-agent UA     set an explicit user agent string\n"
+"  --safari-version N  rewrite only the Version/ token WebKit generates,\n"
+"                      keeping the platform string and the rest of it.\n"
+"                      WebKitGTK derives that token from its own release\n"
+"                      numbers and the result is no Safari that shipped,\n"
+"                      so sites that look the version up give up on it.\n"
+"                      A real one, e.g. 18.6 (safari_version = 18.6)\n"
 "  --allow-popups      let pages open windows without a click (Zoom,\n"
 "                      meeting and login flows that open a tab after a\n"
 "                      server round trip). popups = allow in a config file\n"
@@ -2442,7 +2470,7 @@ usage (const char *argv0, gboolean to_stdout)
 "           no_media page_title middle_click_paste select_all load_bar\n"
 "           lock (page, site or no: stay on the address given)\n"
 "           css\n"
-"           user_agent quiet popups (allow: see --allow-popups)\n"
+"           user_agent safari_version quiet popups (see --allow-popups)\n"
 "           always_overwrite  search_default (which keyword needs no prefix)\n"
 "           gsk (GTK's renderer: gl, cairo, vulkan, ngl)\n"
 "           feature = Name[=on|off] (a WebKit runtime feature; repeatable)\n"
@@ -7358,6 +7386,25 @@ setup_session (void)
     g_free (cache_dir);
 }
 
+/*
+ * Swap the Version/<x> token in a user agent for another, leaving the
+ * rest of the string exactly as it was. NULL if there is no such token
+ * to replace, so the caller can say so rather than inventing one.
+ */
+static char *
+ua_with_safari_version (const char *ua, const char *ver)
+{
+    const char *p = ua ? strstr (ua, "Version/") : NULL;
+    if (!p)
+        return NULL;
+
+    const char *rest = p + strlen ("Version/");
+    while (*rest && *rest != ' ')
+        rest++;
+
+    return g_strdup_printf ("%.*sVersion/%s%s", (int) (p - ua), ua, ver, rest);
+}
+
 static void
 setup_settings (void)
 {
@@ -7370,6 +7417,27 @@ setup_settings (void)
     if (g_user_agent && *g_user_agent) {
         webkit_settings_set_user_agent (g_settings, g_user_agent);
         LOG ("ua: %s\n", g_user_agent);
+    } else if (g_safari_version && *g_safari_version) {
+        /*
+         * WebKitGTK builds the Safari version out of its own release
+         * numbers, and what comes out (Version/60.5 on 2.54) is not a
+         * Safari that ever shipped, so a site holding a table of known
+         * versions gives up on it. Only that token is wrong: the
+         * platform string and everything else WebKit assembled is
+         * worth keeping, so rewrite the token in place instead of
+         * replacing the whole agent, which is what --user-agent and
+         * --ua-safari do.
+         */
+        char *ua = ua_with_safari_version (
+                       webkit_settings_get_user_agent (g_settings),
+                       g_safari_version);
+        if (ua) {
+            webkit_settings_set_user_agent (g_settings, ua);
+            LOG ("ua: %s\n", ua);
+            g_free (ua);
+        } else {
+            LOG ("ua: no Version/ token to rewrite, left as WebKit built it\n");
+        }
     }
 
     /* the inspector's debugger comes with these even with no inspector
@@ -7779,6 +7847,14 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             NEED_ARG ("--user-agent");
             g_free (g_user_agent);
             g_user_agent = g_strdup (argv[++i]);
+        } else if (!strcmp (a, "--safari-version")) {
+            NEED_ARG ("--safari-version");
+            if (!safari_version_ok (argv[i + 1])) {
+                g_printerr ("--safari-version wants digits and dots, e.g. 18.6\n");
+                return 2;
+            }
+            g_free (g_safari_version);
+            g_safari_version = g_strdup (argv[++i]);
         } else if (!strcmp (a, "--ua-chrome")) {
             g_free (g_user_agent);
             g_user_agent = g_strdup ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
