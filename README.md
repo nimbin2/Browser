@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.43.0 (build …), md5 of the sources
+make version        # 4.44.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -268,3 +268,25 @@ enough. The process slept rather than spun, and no watchdog saw it.
 The suspend is off by default now. Offscreen videos keep decoding, which
 costs CPU on a long scroller. `--media-suspend`, or `media_suspend = yes`,
 hands it back to WebKit.
+
+## When a looping clip flickers or sticks on one frame
+
+A second, unrelated bug with the same pages. WebKit's `loop` attribute
+wedges on a short clip: it seeks back to zero at the end and the seek
+never finishes, so `currentTime` stops, `seeking` stays true, and the
+element keeps showing one stale frame.
+
+A seek from script completes every time. So the attribute is taken off
+and the loop runs in the shim, which is on by default. Measured on a
+1.7 s clip over 24 s:
+
+| | loops | `currentTime` | `seeking` |
+| --- | --- | --- | --- |
+| default | 12 | advancing | false |
+| `--no-loop-fix` | 1 | stuck at 0 | true |
+
+`--rtc-trace` logs a `loop-fix` line per element. `--no-loop-fix`, or
+`loop_fix = no`, leaves it to WebKit.
+
+Native `loop` fires no `ended` event and this does, so the shim stops
+the event rather than letting a page see one it never expected.

@@ -43,6 +43,7 @@ static guint    g_capture_watch;
 
 /* camera / media behaviour */
 static gboolean g_cam_fix = TRUE;          /* install the shim (--no-cam-fix: nothing) */
+static gboolean g_loop_fix = TRUE;         /* loop short videos from script, not WebKit */
 /*
  * The shim carries more than camera repairs: --rtc-trace, --web-compat,
  * --no-mic and the offer fixes all ride in it. Installing it must not
@@ -309,6 +310,57 @@ static const char *SHIM_JS =
 "  setInterval(check,1000);"
 "}"
 "if(C.watchdog)watchdog();"
+
+/* ---- looping video ----
+ *
+ * WebKit's own loop attribute wedges on a short clip. At the end it
+ * seeks back to zero and that seek never completes: currentTime stops,
+ * seeking stays true, and the element keeps presenting one stale frame,
+ * which on a page of looping clips reads as flicker. A seek issued from
+ * script does complete - a 1.7s clip looped eleven times without once
+ * reporting seeking - so take the attribute off and do the loop here.
+ *
+ * Videos arrive as the page scrolls, and a clip that short can wedge
+ * before any poll would reach it, so they are caught three ways: a scan
+ * now, a MutationObserver for inserted elements and for the attribute
+ * being set later, and play() itself, which anything looping must call.
+ *
+ * Native loop fires no ended event, and this does, so the event is
+ * stopped here rather than left to reach a page that never expected
+ * one. --no-loop-fix turns the whole thing off.
+ */
+"if(C.loopFix){(function(){"
+"  function fix(v){"
+"    if(v.__bbLoop)return;"
+"    if(!v.loop&&!v.hasAttribute('loop'))return;"
+"    v.__bbLoop=1;"
+"    try{v.loop=false;v.removeAttribute('loop');}catch(e){}"
+"    v.addEventListener('ended',function(e){"
+"      try{e.stopImmediatePropagation();}catch(x){}"
+"      try{v.currentTime=0;var p=v.play();if(p&&p.catch)p.catch(function(){});}catch(x){}"
+"    },true);"
+"    post({ev:'loop-fix',dur:Math.round((v.duration||0)*100)/100,"
+"          src:String(v.currentSrc||v.src||'').slice(-48)});"
+"  }"
+"  function scan(r){"
+"    if(!r)return;"
+"    if(r.tagName==='VIDEO')fix(r);"
+"    if(r.querySelectorAll){var l=r.querySelectorAll('video');"
+"      for(var i=0;i<l.length;i++)fix(l[i]);}"
+"  }"
+"  scan(document);"
+"  try{new MutationObserver(function(ms){"
+"    for(var i=0;i<ms.length;i++){var m=ms[i];"
+"      if(m.type==='attributes'){fix(m.target);continue;}"
+"      for(var j=0;m.addedNodes&&j<m.addedNodes.length;j++)scan(m.addedNodes[j]);"
+"    }"
+"  }).observe(document.documentElement||document,"
+"             {childList:true,subtree:true,attributes:true,attributeFilter:['loop']});"
+"  }catch(e){}"
+"  try{var LP=HTMLMediaElement.prototype,oP=LP.play;"
+"    LP.play=function(){if(this.tagName==='VIDEO')fix(this);"
+"                       return oP.apply(this,arguments);};}catch(e){}"
+"})();}"
 
 /* ---- getUserMedia ---- */
 "var md=navigator.mediaDevices;"
@@ -1862,6 +1914,7 @@ on_script_message (WebKitUserContentManager *ucm, JSCValue *value, gpointer u)
         ev_is (s, "play-rejected") || ev_is (s, "pt-fixed") ||
         ev_is (s, "mic-pin") || ev_is (s, "cam-pin") ||
         ev_is (s, "video-attach") || ev_is (s, "mic-swapped") ||
+        ev_is (s, "loop-fix") ||
         ev_is (s, "mic-swap-failed") || ev_is (s, "video-audio-split") ||
         ev_is (s, "video-audio-rejoin") || ev_is (s, "gum-fps-loosened") ||
         ev_is (s, "rtc-wrapped")   || ev_is (s, "rtc-missing") ||
@@ -2049,7 +2102,7 @@ build_shim (void)
         "maxW:%d,maxH:%d,maxFps:%d,"
         "ssrcFix:%s,codecs:%s,rtcTrace:%s,paramsFix:%s,silentSplit:%s,"
         "compat:%s,noMic:%s,fpsLoose:%s,"
-        "match:%s,micMatch:%s,watchdog:%s,stall:%d,debug:%s};",
+        "match:%s,micMatch:%s,watchdog:%s,stall:%d,loopFix:%s,debug:%s};",
         g_cam_fix        ? "true" : "false",
         (g_cam_repair && g_cam_relax)      ? "true" : "false",
         (g_cam_repair && g_cam_keepalive)  ? "true" : "false",
@@ -2067,6 +2120,7 @@ build_shim (void)
         match, micmatch,
         g_media_watchdog ? "true" : "false",
         g_stall_timeout,
+        g_loop_fix       ? "true" : "false",
         g_shim_debug     ? "true" : "false");
 
     char *js = g_strconcat (cfg, SHIM_JS, NULL);
@@ -2338,6 +2392,11 @@ big_usage_options (GString *s)
 "webrtc (the repairs below are on by default):\n"
 "  --no-fix-webrtc     turn off --sdp-ssrc-fix, --rtc-params-fix and the\n"
 "                      silent-audio split at once (fix_webrtc = no)\n"
+"  --no-loop-fix       leave looping videos to WebKit. On by default:\n"
+"                      WebKit's loop attribute wedges mid-seek on a short\n"
+"                      clip, so the element freezes on one frame. The fix\n"
+"                      takes the attribute off and loops from script\n"
+"                      (loop_fix = no)\n"
 "  --rtc-params-fix    supply RTCRtpSendParameters.codecs when a library\n"
 "                      omits it. WebKit requires it and Firefox does not,\n"
 "                      so a library on its Firefox path throws\n"
@@ -2525,6 +2584,7 @@ big_parse_arg (int argc, char **argv, int *i)
         return TRUE;
     }
     if (!strcmp (a, "--no-fix-webrtc"))  { set_fix_webrtc (FALSE); return TRUE; }
+    if (!strcmp (a, "--no-loop-fix"))    { g_loop_fix = FALSE; return TRUE; }
     if (!strcmp (a, "--no-cam-size-fix") || !strcmp (a, "--no-framerate-fix")) {
         g_fps_loose = FALSE;
         return TRUE;
@@ -2673,6 +2733,11 @@ truthy_value (const char *v)
 static gboolean
 big_cfg_set (const char *key, const char *value)
 {
+    /* loop_fix = no  (the same as --no-loop-fix) */
+    if (!g_ascii_strcasecmp (key, "loop_fix")) {
+        g_loop_fix = truthy_value (value);
+        return TRUE;
+    }
     /*
      * cam_share = yes
      *
@@ -3059,7 +3124,7 @@ big_startup (void)
     if (g_media_debug)
         dump_gstreamer_env ();
 
-    if (g_cam_fix || g_media_watchdog)
+    if (g_cam_fix || g_media_watchdog || g_loop_fix)
         g_shim_js = build_shim ();
 
     /* runs once the main loop starts, i.e. after the window is up */
