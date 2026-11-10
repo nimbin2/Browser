@@ -116,6 +116,7 @@ static gboolean    g_fix_select_all = TRUE;   /* see on_key */
 static gboolean    g_load_bar       = TRUE;   /* the hairline while loading */
 static gboolean    g_no_gpu, g_no_dmabuf, g_no_compositing, g_no_hw_decode;
 static gboolean    g_no_jit;
+static gboolean    g_media_suspend;  /* --media-suspend: let WebKit do it again */
 static gboolean    g_no_devtools;    /* --no-devtools: no inspector machinery at all */
 static gboolean    g_all_messages;    /* --all-messages: no deduplication */
 static gboolean    g_no_console;      /* --no-console: drop the page's logging */
@@ -2109,6 +2110,7 @@ cfg_set (const char *k, const char *v)
     if (key_is (k, "no_compositing")) { g_no_compositing = truthy (v); return TRUE; }
     if (key_is (k, "no_gpu"))         { g_no_gpu         = truthy (v); return TRUE; }
     if (key_is (k, "no_hw_decode"))   { g_no_hw_decode   = truthy (v); return TRUE; }
+    if (key_is (k, "media_suspend"))  { g_media_suspend  = truthy (v); return TRUE; }
 
     if (key_is (k, "feature")) {           /* feature = Name[=on|off], repeatable */
         if (!g_features)
@@ -2357,6 +2359,11 @@ usage (const char *argv0, gboolean to_stdout)
 "                      (GST_PLUGIN_FEATURE_RANK), so software decodes\n"
 "                      the four to reach for when a machine comes back up\n"
 "                      and pages render blank or zero sized\n"
+"  --media-suspend     let WebKit suspend a muted video that scrolls out\n"
+"                      of the viewport. Off by default: resuming one\n"
+"                      deadlocks the web process on a page full of muted\n"
+"                      autoplay videos, which is how \"GIF\" sites serve\n"
+"                      them. Leaving them to play costs CPU instead\n"
 "  --enable-middle-click-paste\n"
 "                      let middle-button clicks reach the page. They are\n"
 "                      swallowed by default, so a stray click cannot paste\n"
@@ -2441,6 +2448,7 @@ usage (const char *argv0, gboolean to_stdout)
 "           feature = Name[=on|off] (a WebKit runtime feature; repeatable)\n"
 "           no_dmabuf no_compositing no_gpu no_hw_decode (the same as the\n"
 "           --no-* flags, as settled preferences)\n"
+"           media_suspend (yes = --media-suspend; default no)\n"
 "           search_KEY (e.g. search_s = https://google.com/search?q={})\n"
 "\n"
 "misc:\n"
@@ -7749,6 +7757,8 @@ browser_main (int argc, char **argv, const BrowserApp *app)
             g_no_compositing = TRUE;
         } else if (!strcmp (a, "--no-hw-decode")) {
             g_no_hw_decode = TRUE;
+        } else if (!strcmp (a, "--media-suspend")) {
+            g_media_suspend = TRUE;
         } else if (!strcmp (a, "--enable-middle-click-paste")) {
             g_no_middle_paste = FALSE;
         } else if (!strcmp (a, "--download-dir")) {
@@ -7894,6 +7904,25 @@ browser_main (int argc, char **argv, const BrowserApp *app)
     }
     if (g_no_dmabuf)      g_setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", TRUE);
     if (g_no_compositing) g_setenv ("WEBKIT_DISABLE_COMPOSITING_MODE", "1", TRUE);
+    /*
+     * WebKit suspends a muted video that scrolls out of the viewport, and
+     * resumes it when it comes back, by setting the GStreamer pipeline's
+     * state from the main thread - inside the layout that the scroll
+     * itself triggered. When the pipeline's sinks are still prerolling,
+     * they hold the element's state lock and are waiting for the state
+     * change to finish, so the main thread blocks on the lock forever and
+     * the page never answers another key. A gallery of muted autoplay
+     * videos - which is how every "GIF" site serves them - hits this
+     * within a dozen items, and nothing recovers it: the process is
+     * asleep, not spinning, so no watchdog sees it either.
+     *
+     * The suspend is only an optimisation, and WebKit reads this variable
+     * (once, before the web process starts) to turn it off. Offscreen
+     * videos then keep decoding, which costs CPU on a long scroller and
+     * is the trade --media-suspend exists to undo.
+     */
+    if (!g_media_suspend)
+        g_setenv ("WEBKIT_GST_ALLOW_PLAYBACK_OF_INVISIBLE_VIDEOS", "1", TRUE);
     /* WebKitGTK 2.54 has no switch of its own for this (the old
      * WEBKIT_GST_ENABLE_HW_DECODERS is gone). GStreamer's documented way
      * is the feature rank: a decoder at NONE is never autoplugged. */

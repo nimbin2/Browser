@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.41.0 (build …), md5 of the sources
+make version        # 4.42.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -252,3 +252,19 @@ browser-mini URL --gsk cairo       # GTK renderer (default gl)
 
 `--feature NAME[=on|off]` sets a WebKit runtime feature, `--list-features`
 lists them. `--gl-info` checks the graphics stack.
+
+## When a gallery of GIFs freezes
+
+It does not any more. WebKit used to suspend a muted video that scrolled
+out of the viewport and resume it on the way back, by setting the
+GStreamer pipeline's state from the main thread inside the scroll's own
+layout. If the pipeline's sinks were still prerolling they held the
+state lock and waited for that change to finish, so the main thread
+blocked on the lock and the page never answered another key.
+
+Every "GIF" site serves muted autoplay videos, so a dozen items were
+enough. The process slept rather than spun, and no watchdog saw it.
+
+The suspend is off by default now. Offscreen videos keep decoding, which
+costs CPU on a long scroller. `--media-suspend`, or `media_suspend = yes`,
+hands it back to WebKit.
