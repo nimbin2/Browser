@@ -30,7 +30,7 @@ make                # build both
 make install        # into /usr/bin (PREFIX=... to change)
 make uninstall
 make clean
-make version        # 4.45.0 (build …), md5 of the sources
+make version        # 4.47.0 (build …), md5 of the sources
 ```
 
 ## Usage
@@ -270,6 +270,20 @@ browser-mini URL --gsk cairo       # GTK renderer (default gl)
 
 `--feature NAME[=on|off]` sets a WebKit runtime feature, `--list-features`
 lists them. `--gl-info` checks the graphics stack.
+
+These are turned on here, because WebKit ships them off outside Cocoa
+and a page that stores data cannot see the API at all without them:
+
+| feature | without it |
+| --- | --- |
+| `StorageAPI` | `navigator.storage` undefined |
+| `StorageAPIEstimate` | `navigator.storage.estimate()` undefined |
+| `FileSystem` | `navigator.storage.getDirectory()` undefined |
+| `AccessHandle` + `FileSystemWritableStream` | `createWritable()` absent, so OPFS is read-only |
+
+`createWritable` needs both of the last two: it is declared
+`[EnabledBySetting=AccessHandleEnabled&FileSystemWritableStreamEnabled]`,
+so one alone changes nothing. `--feature StorageAPI=off` still wins.
 
 ## When a gallery of GIFs freezes
 

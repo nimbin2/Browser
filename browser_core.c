@@ -1262,14 +1262,50 @@ features_list (const char *filter)
     webkit_feature_list_unref (all);
 }
 
+/*
+ * WebKit ships all of these off outside Cocoa, and without them a page
+ * that keeps data sees nothing to keep it in: no StorageAPI means
+ * navigator.storage is undefined, no FileSystem means getDirectory is.
+ *
+ * createWritable - the whole point of a private file system - is
+ * declared [EnabledBySetting=AccessHandleEnabled&FileSystemWritableStr\
+ * eamEnabled], so both of those have to be on or the method is absent
+ * and only reads work. The code is portable WebCore; it is the per-port
+ * default that is false, not the implementation that is missing.
+ *
+ * Applied before the list from the config and the command line, so
+ * --feature StorageAPI=off still wins.
+ */
+static const struct { const char *id; gboolean on; } FEATURE_DEFAULTS[] = {
+    { "StorageAPI",               TRUE },
+    { "StorageAPIEstimate",       TRUE },
+    { "FileSystem",               TRUE },
+    { "AccessHandle",             TRUE },
+    { "FileSystemWritableStream", TRUE },
+};
+
 static void
 features_apply (WebKitSettings *s)
 {
-    if (!g_features)
-        return;
-
     WebKitFeatureList *all = webkit_settings_get_all_features ();
     gsize              n   = webkit_feature_list_get_length (all);
+
+    for (gsize d = 0; d < G_N_ELEMENTS (FEATURE_DEFAULTS); d++)
+        for (gsize i = 0; i < n; i++) {
+            WebKitFeature *f  = webkit_feature_list_get (all, i);
+            const char    *id = webkit_feature_get_identifier (f);
+
+            if (!id || g_ascii_strcasecmp (id, FEATURE_DEFAULTS[d].id) != 0)
+                continue;
+            if (webkit_settings_get_feature_enabled (s, f) != FEATURE_DEFAULTS[d].on)
+                webkit_settings_set_feature_enabled (s, f, FEATURE_DEFAULTS[d].on);
+            break;
+        }
+
+    if (!g_features) {
+        webkit_feature_list_unref (all);
+        return;
+    }
 
     for (guint k = 0; k < g_features->len; k++) {
         char     *spec = g_ptr_array_index (g_features, k);
